@@ -30,11 +30,11 @@ class WikiDataset:
 class BlockRecurrentDecoder(nn.Module):
     """As simple as I can make the model.
     """
-    
-    def __init__(self, num_tokens, dim):
+
+    def __init__(self, config, num_tokens, dim):
         super().__init__()
         self.embed = TokenEmbedding(dim, num_tokens)
-        self.attn = BlockRecurrentAttention(dim, dim)
+        self.attn = BlockRecurrentAttention(config, dim, dim)
         self.to_logits = nn.Linear(dim, num_tokens, bias=False)
         self.norm = nn.LayerNorm(dim)
     
@@ -52,8 +52,8 @@ def setup_tokenizer():
 
 
 
-def train( data, tokenizer, config):
-    model = BlockRecurrentDecoder(len(tokenizer), 512)
+def train(data, tokenizer, config):
+    model = BlockRecurrentDecoder(config, len(tokenizer), config.d_model)
     model.to(device)
     opt = Adam(model.parameters())
     train_data = WikiDataset(data['train'])
@@ -62,17 +62,20 @@ def train( data, tokenizer, config):
     for raw_batch in tqdm(data_loader):
         state = None
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
-        for text in tqdm(long_sequence_splitter(article_batch, config.window_len)):
-            inputs = text[:, :-1]
-            targets = text[:, 1:]
+        train_loss = 0
+        for text in long_sequence_splitter(article_batch, config.window_len):
+            opt.zero_grad()
+            inputs = text[:, :-1].cuda()
+            targets = text[:, 1:].cuda()
             preds, state = model(inputs, state)
-            loss = cross_entropy(preds, targets)
+            loss = cross_entropy(preds.permute(0, 2, 1), targets)
             loss.backward()
             opt.step()
-            preds, state = preds.detach(), state.detach()
-            preds.to('cpu')
+            state = state.detach()
             i += 1
-        
+            train_loss += loss.item()
+        print(f'Train loss: {train_loss}')
+        train_loss = 0
 
 
 

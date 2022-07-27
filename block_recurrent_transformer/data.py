@@ -5,7 +5,8 @@ def get_seq_indices(seq_len: int, window_len: int) -> List[Tuple[int, int]]:
     prev = 0
     inds = []
     for curr in range(window_len, seq_len + 1, window_len):
-        inds.append((prev, curr + 1))
+        inds.append((prev, curr))
+        prev = curr
     return inds
 
 

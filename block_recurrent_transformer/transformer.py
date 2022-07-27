@@ -175,15 +175,17 @@ class Attention(nn.Module):
 class BlockRecurrentAttention(nn.Module):
     def __init__(
         self,
+        config,
         dim: int,
         dim_state: int,
         dim_head: int = DEFAULT_DIM_HEAD,
-        state_len: int = 512,
         heads: int = 8,
         **kwargs
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
+
+        self.config = config
 
         attn_kwargs = {}
 
@@ -192,7 +194,7 @@ class BlockRecurrentAttention(nn.Module):
 
         self.heads = heads
         self.causal = True
-        self.state_len = state_len
+        self.state_len = config.state_len
         rotary_emb_dim = max(dim_head // 2, MIN_DIM_HEAD)
         self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim)
         
@@ -206,7 +208,10 @@ class BlockRecurrentAttention(nn.Module):
         self.ff_gate = RecurrentStateGate(dim)
 
         self.input_proj = nn.Linear(dim + dim_state, dim, bias = False)
-        self.state_proj = nn.Linear(dim + dim_state, dim, bias = False)
+        if config.bottom_up:
+            self.state_proj = nn.Linear(dim + dim_state, dim, bias = False)
+        else:
+            self.state_proj = nn.Linear(dim, dim, bias = False)
 
         self.input_ff = FeedForward(dim)
         self.state_ff = FeedForward(dim_state)
@@ -233,7 +238,10 @@ class BlockRecurrentAttention(nn.Module):
         state_as_q_cross_attn = self.state_input_cross_attn(state, context = x, mask = state_mask)
 
         projected_input = self.input_proj(torch.concat((input_as_q_cross_attn, input_attn), dim=2))
-        projected_state = self.state_proj(torch.concat((state_as_q_cross_attn, state_attn), dim=2))
+        if self.config.bottom_up:
+            projected_state = self.state_proj(torch.concat((state_as_q_cross_attn, state_attn), dim=2))
+        else:
+            projected_state = self.state_proj(state_attn)
 
         input_residual = projected_input + x
         state_residual = self.proj_gate(projected_state, state)
