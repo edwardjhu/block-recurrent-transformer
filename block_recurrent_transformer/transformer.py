@@ -235,18 +235,72 @@ class BlockRecurrentAttention(nn.Module):
         # TODO: This is different from how it is implemented in the paper, because the Keys and Values aren't shared
         # between the cross attention and self-attention. I'll implement that later, this is faster for now.
         input_as_q_cross_attn = self.input_state_cross_attn(x, context = state, mask = mask)
-        state_as_q_cross_attn = self.state_input_cross_attn(state, context = x, mask = state_mask)
-
         projected_input = self.input_proj(torch.concat((input_as_q_cross_attn, input_attn), dim=2))
         if self.config.bottom_up:
+            state_as_q_cross_attn = self.state_input_cross_attn(state, context = x, mask = state_mask)
             projected_state = self.state_proj(torch.concat((state_as_q_cross_attn, state_attn), dim=2))
         else:
             projected_state = self.state_proj(state_attn)
 
         input_residual = projected_input + x
-        state_residual = self.proj_gate(projected_state, state)
+        #state_residual = self.proj_gate(projected_state, state)
+        state_residual = projected_state + state
 
         output = self.input_ff(input_residual) + input_residual
-        next_state = self.ff_gate(self.state_ff(state_residual), state_residual)
+        #next_state = self.ff_gate(self.state_ff(state_residual), state_residual)
+        next_state = self.state_ff(state_residual) + state_residual
 
         return output, next_state
+
+
+class VanillaTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        config,
+        dim: int,
+        dim_head: int = DEFAULT_DIM_HEAD,
+        heads: int = 8,
+        **kwargs
+    ):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+
+        self.config = config
+
+        attn_kwargs = {}
+
+        self.dim = dim
+
+        self.heads = heads
+        self.causal = True
+        rotary_emb_dim = max(dim_head // 2, MIN_DIM_HEAD)
+        self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim)
+        
+        self.input_self_attn = Attention(dim, heads = heads, causal = False, **attn_kwargs)
+
+        self.input_proj = nn.Linear(dim, dim, bias = False)
+
+
+        self.input_ff = FeedForward(dim)
+
+
+    @typechecked
+    def forward(
+        self,
+        x: SeqTensor,
+        mask = None,
+    ) -> SeqTensor:
+        batch, seq_len, device = x.shape[0], x.shape[-2], x.device
+        self_attn_pos_emb = self.rotary_pos_emb(seq_len, device = device)
+        input_attn = self.input_self_attn(x, mask = mask, pos_emb = self_attn_pos_emb)
+
+        # TODO: This is different from how it is implemented in the paper, because the Keys and Values aren't shared
+        # between the cross attention and self-attention. I'll implement that later, this is faster for now.
+        projected_input = self.input_proj(input_attn)
+
+
+        input_residual = projected_input + x
+
+        output = self.input_ff(input_residual) + input_residual
+
+        return output

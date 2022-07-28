@@ -1,7 +1,7 @@
 seq_len: 4096
-window_len: 512
+window_len: 256
 batch_size: 128
 # architecture
-d_model: 256
-state_len: 16
-bottom_up: True
+d_model: 512
+state_len: 1
+bottom_up: False
