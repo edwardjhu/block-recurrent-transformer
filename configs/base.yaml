@@ -3,5 +3,6 @@ window_len: 256
 batch_size: 128
 # architecture
 d_model: 512
+num_layers: 3
 state_len: 1
 bottom_up: False

@@ -11,7 +11,7 @@ from transformers import GPT2Tokenizer
 from x_transformers.x_transformers import TokenEmbedding
 import wandb
 
-from block_recurrent_transformer import BlockRecurrentAttention, long_sequence_splitter
+from block_recurrent_transformer import BlockRecurrentBlock, long_sequence_splitter
 from block_recurrent_transformer.transformer import VanillaTransformerBlock
 
 
@@ -36,7 +36,8 @@ class BlockRecurrentDecoder(nn.Module):
     def __init__(self, config, num_tokens, dim):
         super().__init__()
         self.embed = TokenEmbedding(dim, num_tokens)
-        self.attn = BlockRecurrentAttention(config, dim, dim)
+        self.layers = nn.ModuleList([BlockRecurrentBlock(config, dim, dim) \
+                                        for _ in range(config.num_layers)])
         self.to_logits = nn.Linear(dim, num_tokens, bias=False)
         self.to_gaussian = nn.Linear(dim, 2*dim, bias=False)
         self.h0 = nn.Parameter(torch.zeros(1, config.state_len, 2*dim))
@@ -48,8 +49,10 @@ class BlockRecurrentDecoder(nn.Module):
         h0_mean = broadcasted_h0[:, :, :self.dim]
         h0_logvar = broadcasted_h0[:, :, self.dim:]
         eps = h0_mean.new(h0_mean.shape).normal_(0, 1)
-        x, state = self.attn(self.embed(x), state if state is not None else \
-                                            h0_mean + h0_logvar*eps)
+        x = self.embed(x)
+        for layer in self.layers:
+            x, state = layer(x, state if state is not None else \
+                                h0_mean + h0_logvar*eps)
         x = self.to_logits(self.norm(x))
         state = self.to_gaussian(state)
         return x, state
@@ -61,12 +64,15 @@ class BiTransformer(nn.Module):
     def __init__(self, config, num_tokens, dim):
         super().__init__()
         self.embed = TokenEmbedding(dim, num_tokens)
-        self.attn = VanillaTransformerBlock(config, dim)
+        self.layers = nn.ModuleList([VanillaTransformerBlock(config, dim) \
+                                        for _ in range(config.num_layers)])
         self.norm = nn.LayerNorm(dim)
         self.to_gaussian = nn.Linear(dim, 2*dim, bias=False)
     
     def forward(self, x):
-        x = self.attn(self.embed(x))
+        x = self.embed(x)
+        for layer in self.layers:
+            x = layer(x)
         x = self.to_gaussian(x)
         return x
 

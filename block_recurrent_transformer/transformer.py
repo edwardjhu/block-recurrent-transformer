@@ -172,7 +172,7 @@ class Attention(nn.Module):
 
 
 @typechecked
-class BlockRecurrentAttention(nn.Module):
+class BlockRecurrentBlock(nn.Module):
     def __init__(
         self,
         config,
