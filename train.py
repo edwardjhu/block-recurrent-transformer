@@ -18,7 +18,7 @@ from block_recurrent_transformer.transformer import VanillaTransformerBlock
 from apex import amp
 
 class WikiDataset:
-    def __init__(self, data, min_char=20000, max_char=20000):
+    def __init__(self, data, min_char=10000, max_char=10000):
         self.data = data
         self.min_char = min_char
         self.max_char = max_char
@@ -28,7 +28,7 @@ class WikiDataset:
         title = record['title']
         text = record['text']
         if len(text) < self.min_char:
-            return self.__getitem__((i*12317+1123)%len(self.data))
+            return self.__getitem__((i*17)%len(self.data))
         return f'{title}\n\n{text}'[:self.max_char] + ' [EOS]'
     
     def __len__(self):
@@ -51,14 +51,15 @@ class BlockRecurrentDecoder(nn.Module):
         self.dim = dim
     
     def forward(self, x, state=None):
-        broadcasted_h0 = self.h0.repeat(x.size(0), 1, 1)
-        h0_mean = broadcasted_h0[:, :, :self.dim]
-        h0_logvar = broadcasted_h0[:, :, self.dim:]
-        eps = h0_mean.new(h0_mean.shape).normal_(0, 1)
+        if state is None:
+            broadcasted_h0 = self.h0.repeat(x.size(0), 1, 1)
+            h0_mean = broadcasted_h0[:, :, :self.dim]
+            h0_logvar = broadcasted_h0[:, :, self.dim:]
+            eps = h0_mean.new(h0_mean.shape).normal_(0, 1)
+            state = h0_mean + h0_logvar*eps
         x = self.embed(x)
         for layer in self.layers:
-            x, state = layer(x, state if state is not None else \
-                                h0_mean + h0_logvar*eps)
+            x, state = layer(x, state)
         x = self.to_logits(self.norm(x))
         state = self.to_gaussian(state)
         return x, state
@@ -119,10 +120,10 @@ def train(data, tokenizer, config):
                 param_group['lr'] = config.lr * batch_id / config.warmup
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len-1)):
             # add eos token so the low-level model knows when to stop
-            text_eos = torch.cat([text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1)
-            inputs = text_eos[:, :-1].cuda()
+            text_eos = torch.cat([text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
+            inputs = text_eos[:, :-1]
             inputs_mask = inputs != tokenizer.pad_token_id
-            targets = text_eos[:, 1:].cuda()
+            targets = text_eos[:, 1:]
             # add bos token so our BERT can use it to summarize the block
             bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
             # run q(z|x)
@@ -164,10 +165,10 @@ def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
         # manually specify h0
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len-1)):
             # add eos token so the low-level model knows when to stop
-            text_eos = torch.cat([text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1)
-            inputs = text_eos[:, :-1].cuda()
+            text_eos = torch.cat([text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
+            inputs = text_eos[:, :-1]
             inputs_mask = inputs != tokenizer.pad_token_id
-            targets = text_eos[:, 1:].cuda()
+            targets = text_eos[:, 1:]
             # add bos token so our BERT can use it to summarize the block
             bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
             # run q(z|x)
