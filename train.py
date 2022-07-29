@@ -7,7 +7,7 @@ from torch.nn.functional import cross_entropy
 from torch.optim import Adam
 import torch
 from tqdm import tqdm
-from transformers import GPT2Tokenizer
+from transformers import AdamW, GPT2Tokenizer
 from x_transformers.x_transformers import TokenEmbedding
 import wandb
 
@@ -82,23 +82,25 @@ def setup_tokenizer():
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     return tokenizer
 
-
-torch.autograd.set_detect_anomaly(True)
+from itertools import chain
 def train(data, tokenizer, config):
     model = BlockRecurrentDecoder(config, len(tokenizer), config.d_model)
     model.to(device)
     posterior_model = BiTransformer(config, len(tokenizer), config.d_model)
     posterior_model.to(device)
-    opt = Adam(model.parameters(), lr=1e-4)
+    opt = AdamW(chain(model.parameters(), posterior_model.parameters()), lr=config.lr, betas=(0.9, 0.95), weight_decay=0.01)
     train_data = WikiDataset(data['train'])
     data_loader = DataLoader(train_data,  batch_size = config.batch_size, sampler = RandomSampler(train_data), pin_memory=True)
 
-    for raw_batch in tqdm(data_loader):
+    for batch_id, raw_batch in enumerate(tqdm(data_loader), 1):
         state = None
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
         train_loss = 0
         # manually specify h0
         prev_state = model.h0.repeat(article_batch.size(0), 1, 1)
+        if batch_id <= config.warmup:
+            for param_group in opt.param_groups:
+                param_group['lr'] = config.lr * batch_id / config.warmup
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len-1)):
             opt.zero_grad()
             # add eos token so the low-level model knows when to stop
@@ -126,8 +128,45 @@ def train(data, tokenizer, config):
             loss.backward(retain_graph=True)
             train_loss += loss.item()
         opt.step()
-        print(f'Train loss: {train_loss / i}')
-        train_loss = 0
+        if batch_id % 10 == 0:
+            valid(model, posterior_model,   data, tokenizer, config)
+            print(f'Train loss: {train_loss / 10}')
+            train_loss = 0
+
+@torch.no_grad()
+def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
+    model.eval()
+    posterior_model.eval()
+    valid_data = WikiDataset(data['train'])
+    data_loader = DataLoader(valid_data,  batch_size = config.batch_size, pin_memory=True)
+
+    for batch_id, raw_batch in enumerate(data_loader):
+        article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
+        valid_loss = 0
+        # manually specify h0
+        for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len-1)):
+            # add eos token so the low-level model knows when to stop
+            text_eos = torch.cat([text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1)
+            inputs = text_eos[:, :-1].cuda()
+            targets = text_eos[:, 1:].cuda()
+            # add bos token so our BERT can use it to summarize the block
+            bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
+            # run q(z|x)
+            state_posterior = posterior_model(bos_text.cuda())[:, :config.state_len]
+            qz_mean = state_posterior[:, :, :config.d_model]
+            qz_logvar = state_posterior[:, :, :config.d_model]
+            # use z ~ q(z|x) to generate p(x|z)
+            eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
+            preds, _ = model(inputs, qz_mean + (0.5*qz_logvar).exp()*eps)
+            # reconstruction loss
+            rec_loss = cross_entropy(preds.permute(0, 2, 1), targets)
+
+            loss = rec_loss
+            valid_loss += loss.item()
+        if batch_id == num_samples:
+            break
+    print(f'Valid loss: {valid_loss / num_samples}')
+    model.train()
 
 
 
