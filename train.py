@@ -16,14 +16,18 @@ from block_recurrent_transformer.transformer import VanillaTransformerBlock
 
 
 class WikiDataset:
-    def __init__(self, data):
+    def __init__(self, data, min_char=20000, max_char=20000):
         self.data = data
+        self.min_char = min_char
+        self.max_char = max_char
     
     def __getitem__(self, i: int):
         record = self.data[i]
         title = record['title']
         text = record['text']
-        return f'{title}\n\n{text}'
+        if len(text) < self.min_char:
+            return self.__getitem__((i+1)%len(self.data))
+        return f'{title}\n\n{text}'[:self.max_char] + ' [EOS]'
     
     def __len__(self):
         return len(self.data)
@@ -106,6 +110,7 @@ def train(data, tokenizer, config):
             # add eos token so the low-level model knows when to stop
             text_eos = torch.cat([text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1)
             inputs = text_eos[:, :-1].cuda()
+            inputs_mask = inputs != tokenizer.pad_token_id
             targets = text_eos[:, 1:].cuda()
             # add bos token so our BERT can use it to summarize the block
             bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
@@ -117,7 +122,7 @@ def train(data, tokenizer, config):
             eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
             preds, state = model(inputs, qz_mean + (0.5*qz_logvar).exp()*eps)
             # reconstruction loss
-            rec_loss = cross_entropy(preds.permute(0, 2, 1), targets)
+            rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask])
             # prior matching loss KL(qz||pz)
             pz_mean = prev_state[:, :, config.d_model:]
             pz_logvar = prev_state[:, :, config.d_model:]
@@ -148,6 +153,7 @@ def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
             # add eos token so the low-level model knows when to stop
             text_eos = torch.cat([text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1)
             inputs = text_eos[:, :-1].cuda()
+            inputs_mask = inputs != tokenizer.pad_token_id
             targets = text_eos[:, 1:].cuda()
             # add bos token so our BERT can use it to summarize the block
             bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
@@ -159,13 +165,13 @@ def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
             eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
             preds, _ = model(inputs, qz_mean + (0.5*qz_logvar).exp()*eps)
             # reconstruction loss
-            rec_loss = cross_entropy(preds.permute(0, 2, 1), targets)
+            rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask])
 
             loss = rec_loss
-            valid_loss += loss.item()
+            valid_loss += loss.item() / inputs_mask.sum().item()
         if batch_id == num_samples:
             break
-    print(f'Valid loss: {valid_loss / num_samples}')
+    print(f'Valid PPL: {2.**valid_loss / num_samples}')
     model.train()
 
 
