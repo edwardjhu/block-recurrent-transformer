@@ -1,4 +1,5 @@
-seq_len: 4096
+seed: 47
+# training
 window_len: 256
 batch_size: 64
 warmup: 40
@@ -6,5 +7,5 @@ lr: 0.001
 # architecture
 d_model: 512
 num_layers: 4
-state_len: 4
+state_len: 0
 bottom_up: False

@@ -1,10 +1,9 @@
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from numpy import broadcast
 from omegaconf import OmegaConf
 from torch.utils.data import RandomSampler, DataLoader
 from torch import nn
 from torch.nn.functional import cross_entropy
-from torch.optim import Adam
 import torch
 from tqdm import tqdm
 from transformers import AdamW, GPT2Tokenizer
@@ -18,17 +17,14 @@ from block_recurrent_transformer.transformer import VanillaTransformerBlock
 from apex import amp
 
 class WikiDataset:
-    def __init__(self, data, min_char=10000, max_char=10000):
+    def __init__(self, data, max_char=10000):
         self.data = data
-        self.min_char = min_char
         self.max_char = max_char
     
     def __getitem__(self, i: int):
         record = self.data[i]
         title = record['title']
         text = record['text']
-        if len(text) < self.min_char:
-            return self.__getitem__((i*17)%len(self.data))
         return f'{title}\n\n{text}'[:self.max_char] + ' [EOS]'
     
     def __len__(self):
@@ -136,10 +132,12 @@ def train(data, tokenizer, config):
             # reconstruction loss
             rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask])
             # prior matching loss KL(qz||pz)
-            pz_mean = prev_state[:, :, :config.d_model]
-            pz_logvar = prev_state[:, :, config.d_model:]
-            prior_loss = ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp()).mean()
-
+            if config.state_len > 0:
+                pz_mean = prev_state[:, :, :config.d_model]
+                pz_logvar = prev_state[:, :, config.d_model:]
+                prior_loss = ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp()).mean()
+            else:
+                prior_loss = 0.
             prev_state = state
             loss = rec_loss+prior_loss
             #loss.backward(retain_graph=True)
@@ -193,8 +191,13 @@ def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
 if __name__ == '__main__':
     device = 'cuda:0'
     data = load_dataset("wikipedia", "20220301.en")
+    #data = load_from_disk("/home/v-edwardhu/.cache/huggingface/datasets/wikipedia/20220301.en.min10000/train")
+    data.filter(lambda x : len(x['text'])>10000)
+
     tokenizer = setup_tokenizer()
     config = OmegaConf.load('configs/base.yaml')
+
+    torch.manual_seed(config.seed)
 
     train(data, tokenizer, config)
     
