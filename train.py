@@ -14,6 +14,8 @@ import wandb
 from block_recurrent_transformer import BlockRecurrentBlock, long_sequence_splitter
 from block_recurrent_transformer.transformer import VanillaTransformerBlock
 
+# apex magic
+from apex import amp
 
 class WikiDataset:
     def __init__(self, data, min_char=20000, max_char=20000):
@@ -93,6 +95,16 @@ def train(data, tokenizer, config):
     posterior_model = BiTransformer(config, len(tokenizer), config.d_model)
     posterior_model.to(device)
     opt = AdamW(chain(model.parameters(), posterior_model.parameters()), lr=config.lr, betas=(0.9, 0.95), weight_decay=0.01)
+
+    # apex magic
+    models, opt = amp.initialize(
+        [model, posterior_model],
+        opt,
+        opt_level='O2',
+        )
+    model = models[0]
+    posterior_model = models[1]
+
     train_data = WikiDataset(data['train'])
     data_loader = DataLoader(train_data,  batch_size = config.batch_size, sampler = RandomSampler(train_data), pin_memory=True)
 
@@ -144,10 +156,10 @@ def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
     posterior_model.eval()
     valid_data = WikiDataset(data['train'])
     data_loader = DataLoader(valid_data,  batch_size = config.batch_size, pin_memory=True)
-
+    valid_loss = 0
+    total_tokens = 0
     for batch_id, raw_batch in enumerate(data_loader):
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
-        valid_loss = 0
         # manually specify h0
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len-1)):
             # add eos token so the low-level model knows when to stop
@@ -165,14 +177,16 @@ def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
             eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
             preds, _ = model(inputs, qz_mean + (0.5*qz_logvar).exp()*eps)
             # reconstruction loss
-            rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask])
+            rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask], reduction='sum')
 
             loss = rec_loss
-            valid_loss += loss.item() / inputs_mask.sum().item()
+            valid_loss += loss.item()
+            total_tokens += inputs_mask.sum().item()
         if batch_id == num_samples:
             break
-    print(f'Valid PPL: {2.**valid_loss / num_samples}')
+    print(f'Valid PPL: {2.**(valid_loss/total_tokens)}')
     model.train()
+    posterior_model.train()
 
 
 
@@ -181,5 +195,6 @@ if __name__ == '__main__':
     data = load_dataset("wikipedia", "20220301.en")
     tokenizer = setup_tokenizer()
     config = OmegaConf.load('configs/base.yaml')
+
     train(data, tokenizer, config)
     
