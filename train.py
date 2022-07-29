@@ -28,7 +28,7 @@ class WikiDataset:
         title = record['title']
         text = record['text']
         if len(text) < self.min_char:
-            return self.__getitem__((i+1)%len(self.data))
+            return self.__getitem__((i*12317+1123)%len(self.data))
         return f'{title}\n\n{text}'[:self.max_char] + ' [EOS]'
     
     def __len__(self):
@@ -108,17 +108,16 @@ def train(data, tokenizer, config):
     train_data = WikiDataset(data['train'])
     data_loader = DataLoader(train_data,  batch_size = config.batch_size, sampler = RandomSampler(train_data), pin_memory=True)
 
+    train_loss = 0
     for batch_id, raw_batch in enumerate(tqdm(data_loader), 1):
-        state = None
+        opt.zero_grad()
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
-        train_loss = 0
         # manually specify h0
         prev_state = model.h0.repeat(article_batch.size(0), 1, 1)
         if batch_id <= config.warmup:
             for param_group in opt.param_groups:
                 param_group['lr'] = config.lr * batch_id / config.warmup
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len-1)):
-            opt.zero_grad()
             # add eos token so the low-level model knows when to stop
             text_eos = torch.cat([text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1)
             inputs = text_eos[:, :-1].cuda()
@@ -129,24 +128,26 @@ def train(data, tokenizer, config):
             # run q(z|x)
             state_posterior = posterior_model(bos_text.cuda())[:, :config.state_len]
             qz_mean = state_posterior[:, :, :config.d_model]
-            qz_logvar = state_posterior[:, :, :config.d_model]
+            qz_logvar = state_posterior[:, :, config.d_model:]
             # use z ~ q(z|x) to generate p(x|z)
             eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
             preds, state = model(inputs, qz_mean + (0.5*qz_logvar).exp()*eps)
             # reconstruction loss
             rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask])
             # prior matching loss KL(qz||pz)
-            pz_mean = prev_state[:, :, config.d_model:]
+            pz_mean = prev_state[:, :, :config.d_model]
             pz_logvar = prev_state[:, :, config.d_model:]
             prior_loss = ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp()).mean()
 
             prev_state = state
             loss = rec_loss+prior_loss
-            loss.backward(retain_graph=True)
+            #loss.backward(retain_graph=True)
+            with amp.scale_loss(loss, opt) as scaled_loss:
+                scaled_loss.backward(retain_graph=True)
             train_loss += loss.item()
         opt.step()
         if batch_id % 10 == 0:
-            valid(model, posterior_model,   data, tokenizer, config)
+            valid(model, posterior_model, data, tokenizer, config)
             print(f'Train loss: {train_loss / 10}')
             train_loss = 0
 
@@ -155,8 +156,8 @@ def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
     model.eval()
     posterior_model.eval()
     valid_data = WikiDataset(data['train'])
-    data_loader = DataLoader(valid_data,  batch_size = config.batch_size, pin_memory=True)
-    valid_loss = 0
+    data_loader = DataLoader(valid_data,  batch_size=config.batch_size, pin_memory=True)
+    valid_loss = 0.
     total_tokens = 0
     for batch_id, raw_batch in enumerate(data_loader):
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
@@ -172,15 +173,13 @@ def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
             # run q(z|x)
             state_posterior = posterior_model(bos_text.cuda())[:, :config.state_len]
             qz_mean = state_posterior[:, :, :config.d_model]
-            qz_logvar = state_posterior[:, :, :config.d_model]
+            qz_logvar = state_posterior[:, :, config.d_model:]
             # use z ~ q(z|x) to generate p(x|z)
             eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
             preds, _ = model(inputs, qz_mean + (0.5*qz_logvar).exp()*eps)
             # reconstruction loss
             rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask], reduction='sum')
-
-            loss = rec_loss
-            valid_loss += loss.item()
+            valid_loss += rec_loss.item()
             total_tokens += inputs_mask.sum().item()
         if batch_id == num_samples:
             break

@@ -2,7 +2,7 @@ seq_len: 4096
 window_len: 256
 batch_size: 32
 warmup: 40
-lr: 0.0002
+lr: 0.0005
 # architecture
 d_model: 512
 num_layers: 3
