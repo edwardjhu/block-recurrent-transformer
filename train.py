@@ -17,7 +17,7 @@ from block_recurrent_transformer.transformer import VanillaTransformerBlock
 from apex import amp
 
 class WikiDataset:
-    def __init__(self, data, max_char=10000):
+    def __init__(self, data, max_char=1000):
         self.data = data
         self.max_char = max_char
     
@@ -91,7 +91,9 @@ def train(data, tokenizer, config):
     model.to(device)
     posterior_model = BiTransformer(config, len(tokenizer), config.d_model)
     posterior_model.to(device)
-    opt = AdamW(chain(model.parameters(), posterior_model.parameters()), lr=config.lr, betas=(0.9, 0.95), weight_decay=0.01)
+    opt = AdamW([{'params': model.parameters(), 'lr': config.lr, 'max_lr': config.lr},
+                 {'params': posterior_model.parameters(), 'lr': config.lr, 'max_lr': config.lr}],
+                betas=(config.adam_beta1, config.adam_beta2), weight_decay=0.01)
 
     # apex magic
     models, opt = amp.initialize(
@@ -113,13 +115,13 @@ def train(data, tokenizer, config):
         prev_state = model.h0.repeat(article_batch.size(0), 1, 1)
         if batch_id <= config.warmup:
             for param_group in opt.param_groups:
-                param_group['lr'] = config.lr * batch_id / config.warmup
+                param_group['lr'] = param_group['max_lr'] * batch_id / config.warmup
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len-1)):
             # add eos token so the low-level model knows when to stop
-            text_eos = torch.cat([text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
-            inputs = text_eos[:, :-1]
+            bos_text_eos = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
+            inputs = bos_text_eos[:, :-1]
             inputs_mask = inputs != tokenizer.pad_token_id
-            targets = text_eos[:, 1:]
+            targets = bos_text_eos[:, 1:]
             # add bos token so our BERT can use it to summarize the block
             bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
             # run q(z|x)
@@ -135,7 +137,7 @@ def train(data, tokenizer, config):
             if config.state_len > 0:
                 pz_mean = prev_state[:, :, :config.d_model]
                 pz_logvar = prev_state[:, :, config.d_model:]
-                prior_loss = ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp()).mean()
+                prior_loss = ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp()).sum(-1).mean()
             else:
                 prior_loss = 0.
             prev_state = state
@@ -146,9 +148,16 @@ def train(data, tokenizer, config):
             train_loss += loss.item()
         opt.step()
         if batch_id % 10 == 0:
-            valid(model, posterior_model, data, tokenizer, config)
+            ppl = valid(model, posterior_model, data, tokenizer, config)
             print(f'Train loss: {train_loss / 10}')
+            wandb.log(dict(
+                step=batch_id,
+                train_loss=train_loss,
+                valid_ppl=ppl,
+            ))
             train_loss = 0
+        if batch_id >= config.max_updates:
+            exit(0)
 
 @torch.no_grad()
 def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
@@ -161,31 +170,44 @@ def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
     for batch_id, raw_batch in enumerate(data_loader):
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
         # manually specify h0
+        prev_state = model.h0.repeat(article_batch.size(0), 1, 1)
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len-1)):
             # add eos token so the low-level model knows when to stop
-            text_eos = torch.cat([text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
-            inputs = text_eos[:, :-1]
+            bos_text_eos = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
+            inputs = bos_text_eos[:, :-1]
             inputs_mask = inputs != tokenizer.pad_token_id
-            targets = text_eos[:, 1:]
+            targets = bos_text_eos[:, 1:]
             # add bos token so our BERT can use it to summarize the block
             bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
             # run q(z|x)
             state_posterior = posterior_model(bos_text.cuda())[:, :config.state_len]
             qz_mean = state_posterior[:, :, :config.d_model]
             qz_logvar = state_posterior[:, :, config.d_model:]
+            if config.use_mean:
+                preds, state = model(inputs, qz_mean)
+            else:
+                eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
+                preds, state = model(inputs, qz_mean + (0.5*qz_logvar).exp()*eps)
             # use z ~ q(z|x) to generate p(x|z)
-            eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
-            preds, _ = model(inputs, qz_mean + (0.5*qz_logvar).exp()*eps)
             # reconstruction loss
             rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask], reduction='sum')
-            valid_loss += rec_loss.item()
-            total_tokens += inputs_mask.sum().item()
+            # prior matching loss KL(qz||pz)
+            if config.state_len > 0:
+                pz_mean = prev_state[:, :, :config.d_model]
+                pz_logvar = prev_state[:, :, config.d_model:]
+                # here we can't ignore the constants in KL like during training
+                prior_loss = 0.5 * ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp() - 1).sum()
+            else:
+                prior_loss = 0.
+            prev_state = state
+            valid_loss += rec_loss.item() + prior_loss.item()
+            total_tokens += inputs_mask.sum().item() - inputs_mask.size(0)
         if batch_id == num_samples:
             break
     print(f'Valid PPL: {2.**(valid_loss/total_tokens)}')
     model.train()
     posterior_model.train()
-
+    return 2.**(valid_loss/total_tokens)
 
 
 if __name__ == '__main__':
@@ -196,6 +218,11 @@ if __name__ == '__main__':
 
     tokenizer = setup_tokenizer()
     config = OmegaConf.load('configs/base.yaml')
+
+    
+    wandb.init(project="Hierarchical-LM", entity="edwardhu", config=config, tags=[config.wandb_tag], mode="online")
+    wandb.define_metric("train_loss", summary="min", step_metric='step')
+    wandb.define_metric("valid_ppl", summary="min", step_metric='step')
 
     torch.manual_seed(config.seed)
 
