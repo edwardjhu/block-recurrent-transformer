@@ -243,12 +243,12 @@ class BlockRecurrentBlock(nn.Module):
             projected_state = self.state_proj(state_attn)
 
         input_residual = projected_input + x
-        #state_residual = self.proj_gate(projected_state, state)
-        state_residual = projected_state + state
+        state_residual = self.proj_gate(projected_state, state)
+        #state_residual = projected_state + state
 
         output = self.input_ff(input_residual) + input_residual
-        #next_state = self.ff_gate(self.state_ff(state_residual), state_residual)
-        next_state = self.state_ff(state_residual) + state_residual
+        next_state = self.ff_gate(self.state_ff(state_residual), state_residual)
+        #next_state = self.state_ff(state_residual) + state_residual
 
         return output, next_state
 

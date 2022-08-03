@@ -92,7 +92,7 @@ def train(data, tokenizer, config):
     posterior_model = BiTransformer(config, len(tokenizer), config.d_model)
     posterior_model.to(device)
     opt = AdamW([{'params': model.parameters(), 'lr': config.lr, 'max_lr': config.lr},
-                 {'params': posterior_model.parameters(), 'lr': config.lr, 'max_lr': config.lr}],
+                 {'params': posterior_model.parameters(), 'lr': config.lr, 'max_lr': 0.2*config.lr}],
                 betas=(config.adam_beta1, config.adam_beta2), weight_decay=0.01)
 
     # apex magic
@@ -137,7 +137,7 @@ def train(data, tokenizer, config):
             if config.state_len > 0:
                 pz_mean = prev_state[:, :, :config.d_model]
                 pz_logvar = prev_state[:, :, config.d_model:]
-                prior_loss = ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp()).sum(-1).mean()
+                prior_loss = 0.5 * ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp() - 1).sum(-1).mean()
             else:
                 prior_loss = 0.
             prev_state = state

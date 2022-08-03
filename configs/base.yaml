@@ -12,6 +12,6 @@ use_mean: False
 # architecture
 d_model: 512
 num_layers: 4
-state_len: 2
+state_len: 4
 bottom_up: False
-wandb_tag: baseline
+wandb_tag: ours
