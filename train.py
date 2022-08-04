@@ -17,7 +17,7 @@ from block_recurrent_transformer.transformer import VanillaTransformerBlock
 from apex import amp
 
 class WikiDataset:
-    def __init__(self, data, max_char=20):
+    def __init__(self, data, max_char=1000):
         self.data = data
         self.max_char = max_char
     
@@ -82,6 +82,20 @@ class BiTransformer(nn.Module):
         x = self.to_gaussian(self.norm(x))
         return x
 
+class UpstreamLSTM(nn.Module):
+    """As simple as I can make the model.
+    """
+
+    def __init__(self, dim, num_layers):
+        super().__init__()
+        self.lstm = nn.LSTM(dim, dim, num_layers=num_layers, batch_first=True)
+        self.to_gaussian = nn.Linear(dim, 2*dim)
+    
+    def forward(self, x, hidden):
+        out, hidden = self.lstm(x, hidden)
+        out = self.to_gaussian(out)
+        return out, hidden
+
 
 def setup_tokenizer():
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2-large')
@@ -90,22 +104,26 @@ def setup_tokenizer():
 
 from itertools import chain
 def train(data, tokenizer, config):
+    upstream_model = UpstreamLSTM(config.d_model, num_layers=config.lstm_layers)
+    upstream_model.to(device)
     model = BlockRecurrentDecoder(config, len(tokenizer), config.d_model)
     model.to(device)
     posterior_model = BiTransformer(config, len(tokenizer), config.d_model)
     posterior_model.to(device)
     opt = AdamW([{'params': model.parameters(), 'lr': config.lr, 'max_lr': config.lr},
+                 {'params': upstream_model.parameters(), 'lr': config.lr, 'max_lr': config.lr},
                  {'params': posterior_model.parameters(), 'lr': 0.2*config.lr, 'max_lr': 0.2*config.lr}],
                 betas=(config.adam_beta1, config.adam_beta2), weight_decay=0.01)
     
     # apex magic
     models, opt = amp.initialize(
-        [model, posterior_model],
+        [model, posterior_model, upstream_model],
         opt,
         opt_level='O0',
         )
     model = models[0]
     posterior_model = models[1]
+    upstream_model = models[2]
     
     train_data = WikiDataset(data['train'])
     data_loader = DataLoader(train_data,  batch_size = config.batch_size, sampler = RandomSampler(train_data), pin_memory=True)
@@ -116,6 +134,8 @@ def train(data, tokenizer, config):
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
         # manually specify h0
         prev_state = [model.h0.repeat(article_batch.size(0), 1, 1)]
+        hidden = (prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_model, )),
+                  prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_model, )))
         batch_loss = 0.
         if batch_id <= config.warmup:
             for param_group in opt.param_groups:
@@ -134,7 +154,9 @@ def train(data, tokenizer, config):
             qz_logvar = state_posterior[:, :, config.d_model:]
             # use z ~ q(z|x) to generate p(x|z)
             eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
-            preds, state = model(inputs, qz_mean + (0.5*qz_logvar).exp()*eps)
+            sampled_z = qz_mean + (0.5*qz_logvar).exp()*eps
+            preds, _ = model(inputs, sampled_z)
+            state, hidden = upstream_model(sampled_z, hidden)
             # reconstruction loss
             rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask])
             # prior matching loss KL(qz||pz)
@@ -153,7 +175,7 @@ def train(data, tokenizer, config):
             scaled_loss.backward()
         opt.step()
         if batch_id % 10 == 0:
-            ppl = valid(model, posterior_model, data, tokenizer, config)
+            ppl = valid(model, posterior_model, upstream_model, data, tokenizer, config)
             print(f'Train loss: {train_loss / 10}')
             wandb.log(dict(
                 step=batch_id,
@@ -165,7 +187,7 @@ def train(data, tokenizer, config):
             exit(0)
 
 @torch.no_grad()
-def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
+def valid(model, posterior_model, upstream_model, data, tokenizer, config, num_samples=10):
     model.eval()
     posterior_model.eval()
     valid_data = WikiDataset(data['train'])
@@ -177,6 +199,8 @@ def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
         # manually specify h0
         prev_state = model.h0.repeat(article_batch.size(0), 1, 1)
+        hidden = (prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_model, )),
+                  prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_model, )))
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len)):
             # add eos token so the low-level model knows when to stop
             bos_text_eos = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
@@ -190,10 +214,13 @@ def valid(model, posterior_model, data, tokenizer, config, num_samples=10):
             qz_mean = state_posterior[:, :, :config.d_model]
             qz_logvar = state_posterior[:, :, config.d_model:]
             if config.use_mean:
-                preds, state = model(inputs, qz_mean)
+                sampled_z = qz_mean
+                preds, _ = model(inputs, qz_mean)
             else:
                 eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
-                preds, state = model(inputs, qz_mean + (0.5*qz_logvar).exp()*eps)
+                sampled_z = qz_mean + (0.5*qz_logvar).exp()*eps
+                preds, _ = model(inputs, sampled_z)
+            state, hidden = upstream_model(sampled_z, hidden)
             # use z ~ q(z|x) to generate p(x|z)
             # reconstruction loss
             rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask], reduction='sum')
@@ -221,7 +248,7 @@ if __name__ == '__main__':
     device = 'cuda:0'
     data = load_dataset("wikipedia", "20220301.en")
     #data = load_from_disk("/home/v-edwardhu/.cache/huggingface/datasets/wikipedia/20220301.en.min10000/train")
-    data.filter(lambda x : len(x['text'])>10)
+    data.filter(lambda x : len(x['text'])>10000)
 
     tokenizer = setup_tokenizer()
     config = OmegaConf.load('configs/base.yaml')

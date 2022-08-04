@@ -1,6 +1,6 @@
 seed: 47
 # training
-window_len: 1
+window_len: 3
 batch_size: 64
 warmup: 100
 lr: 0.0005
@@ -12,6 +12,7 @@ use_mean: False
 # architecture
 d_model: 512
 num_layers: 4
-state_len: 0
-bottom_up: False
-wandb_tag: ours
+lstm_layers: 3
+state_len: 1
+bottom_up: True
+wandb_tag: lstm
