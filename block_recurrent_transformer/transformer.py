@@ -99,7 +99,7 @@ class Attention(nn.Module):
         self.causal = causal
         inner_dim = dim_head * heads
 
-        self.norm = RMSNorm(dim)
+        self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
 
         self.to_q = nn.Linear(dim, inner_dim, bias = False)
@@ -195,8 +195,8 @@ class BlockRecurrentBlock(nn.Module):
         self.heads = heads
         self.causal = True
         self.state_len = config.state_len
-        rotary_emb_dim = max(dim_head // 2, MIN_DIM_HEAD)
-        self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim)
+        #rotary_emb_dim = max(dim_head // 2, MIN_DIM_HEAD)
+        #self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim)
         
         self.input_self_attn = Attention(dim, heads = heads, causal = True, **attn_kwargs)
         self.state_self_attn = Attention(dim_state, heads = heads, causal = False, **attn_kwargs)
@@ -227,10 +227,10 @@ class BlockRecurrentBlock(nn.Module):
         batch, seq_len, device = x.shape[0], x.shape[-2], x.device
         if not exists(state):
             state = torch.zeros((batch, self.state_len, self.dim_state), device=device)
-        self_attn_pos_emb = self.rotary_pos_emb(seq_len, device = device)
-        state_pos_emb = self.rotary_pos_emb(self.state_len, device = device)
-        input_attn = self.input_self_attn(x, mask = mask, pos_emb = self_attn_pos_emb)
-        state_attn = self.state_self_attn(state, mask = state_mask, pos_emb = state_pos_emb)
+        #self_attn_pos_emb = self.rotary_pos_emb(seq_len, device = device)
+        #state_pos_emb = self.rotary_pos_emb(self.state_len, device = device)
+        input_attn = self.input_self_attn(x, mask = mask) #, pos_emb = self_attn_pos_emb)
+        state_attn = self.state_self_attn(state, mask = state_mask) #, pos_emb = state_pos_emb)
 
         # TODO: This is different from how it is implemented in the paper, because the Keys and Values aren't shared
         # between the cross attention and self-attention. I'll implement that later, this is faster for now.
@@ -274,13 +274,13 @@ class VanillaTransformerBlock(nn.Module):
         self.heads = heads
         self.causal = True
         rotary_emb_dim = max(dim_head // 2, MIN_DIM_HEAD)
-        self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim)
+        #self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim)
         
         self.input_self_attn = Attention(dim, heads = heads, causal = False, **attn_kwargs)
 
         self.input_proj = nn.Linear(dim, dim, bias = False)
 
-
+        self.ffn_norm = nn.LayerNorm(dim)
         self.input_ff = FeedForward(dim)
 
 
@@ -291,8 +291,8 @@ class VanillaTransformerBlock(nn.Module):
         mask = None,
     ) -> SeqTensor:
         batch, seq_len, device = x.shape[0], x.shape[-2], x.device
-        self_attn_pos_emb = self.rotary_pos_emb(seq_len, device = device)
-        input_attn = self.input_self_attn(x, mask = mask, pos_emb = self_attn_pos_emb)
+        #self_attn_pos_emb = self.rotary_pos_emb(seq_len, device = device)
+        input_attn = self.input_self_attn(x, mask = mask) #, pos_emb = self_attn_pos_emb)
 
         # TODO: This is different from how it is implemented in the paper, because the Keys and Values aren't shared
         # between the cross attention and self-attention. I'll implement that later, this is faster for now.
@@ -301,6 +301,6 @@ class VanillaTransformerBlock(nn.Module):
 
         input_residual = projected_input + x
 
-        output = self.input_ff(input_residual) + input_residual
+        output = self.input_ff(self.ffn_norm(input_residual)) + input_residual
 
         return output
