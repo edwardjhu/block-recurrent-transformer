@@ -93,9 +93,11 @@ class UpstreamLSTM(nn.Module):
         self.to_gaussian = nn.Linear(dim, 2*dim)
     
     def forward(self, x, hidden):
-        out, hidden = self.lstm(x, hidden)
-        out = self.to_gaussian(out)
-        return out, hidden
+        if x.size(1) > 0:
+            out, hidden = self.lstm(x, hidden)
+            out = self.to_gaussian(out)
+            return out, hidden
+        return x.repeat(1, 1, 2), hidden
 
 
 def setup_tokenizer():
@@ -268,7 +270,8 @@ def generate(model, upstream_model, tokenizer, config):
         bos_text = (pz_mean.new_ones(pz_mean.size(0), 1)*tokenizer.bos_token_id).long().cuda()
         for _ in range(config.window_len):
             preds, _ = model(bos_text, sampled_z)
-            bos_text = torch.cat([bos_text, preds[:, -1:, :].argmax(-1)], dim=-1).cuda()    
+            bos_text = torch.cat([bos_text,
+                                  preds[:, -1, :].softmax(dim=-1).multinomial(num_samples=1)], dim=-1).cuda()    
         prev_state, hidden = upstream_model(sampled_z, hidden)
         decoded.append(bos_text[:, 1:])
 
