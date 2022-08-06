@@ -18,7 +18,7 @@ from block_recurrent_transformer.transformer import VanillaTransformerBlock
 from apex import amp
 
 class WikiDataset:
-    def __init__(self, data, max_char=1000):
+    def __init__(self, data, max_char=25):
         self.data = data
         self.max_char = max_char
     
@@ -36,15 +36,15 @@ class BlockRecurrentDecoder(nn.Module):
     """As simple as I can make the model.
     """
 
-    def __init__(self, config, num_tokens, dim):
+    def __init__(self, config, num_tokens, dim, d_latent):
         super().__init__()
         self.embed = TokenEmbedding(dim, num_tokens)
         self.pos_embed = AbsolutePositionalEmbedding(dim, config.window_len + 10)
         self.layers = nn.ModuleList([BlockRecurrentBlock(config, dim, dim) \
                                         for _ in range(config.num_layers)])
         self.to_logits = nn.Linear(dim, num_tokens)
-        self.to_gaussian = nn.Linear(dim, 2*dim)
-        self.h0 = nn.Parameter(torch.zeros(1, config.state_len, 2*dim))
+        self.to_gaussian = nn.Linear(d_latent, dim)
+        self.h0 = nn.Parameter(torch.zeros(1, config.state_len, 2*d_latent))
         self.norm = nn.LayerNorm(dim)
         self.norm_state = nn.LayerNorm(dim)
         self.dim = dim
@@ -57,24 +57,37 @@ class BlockRecurrentDecoder(nn.Module):
             eps = h0_mean.new(h0_mean.shape).normal_(0, 1)
             state = h0_mean + h0_logvar*eps
         x = self.embed(x) + self.pos_embed(x)
+        state = self.to_gaussian(state)
         for layer in self.layers:
             x, state = layer(x, state)
         x = self.to_logits(self.norm(x))
-        state = self.to_gaussian(self.norm_state(state))
         return x, state
+
+
+class LogLinearDecoder(nn.Module):
+    """As simple as I can make the model.
+    """
+
+    def __init__(self, config, num_tokens, dim, d_latent):
+        super().__init__()
+        self.h0 = nn.Parameter(torch.zeros(1, config.state_len, 2*d_latent))
+        self.to_logits = nn.Linear(d_latent, num_tokens)
+    
+    def forward(self, x, state):
+        return self.to_logits(state), state
 
 class BiTransformer(nn.Module):
     """As simple as I can make the model.
     """
 
-    def __init__(self, config, num_tokens, dim):
+    def __init__(self, config, num_tokens, dim, d_latent):
         super().__init__()
         self.embed = TokenEmbedding(dim, num_tokens)
         self.pos_embed = AbsolutePositionalEmbedding(dim, config.window_len + 10)
         self.layers = nn.ModuleList([VanillaTransformerBlock(config, dim) \
                                         for _ in range(config.num_layers)])
         self.norm = nn.LayerNorm(dim)
-        self.to_gaussian = nn.Linear(dim, 2*dim)
+        self.to_gaussian = nn.Linear(dim, 2*d_latent)
     
     def forward(self, x):
         x = self.embed(x) + self.pos_embed(x)
@@ -107,15 +120,16 @@ def setup_tokenizer():
 
 from itertools import chain
 def train(data, tokenizer, config):
-    upstream_model = UpstreamLSTM(config.d_model, num_layers=config.lstm_layers)
+    upstream_model = UpstreamLSTM(config.d_latent, num_layers=config.lstm_layers)
     upstream_model.to(device)
-    model = BlockRecurrentDecoder(config, len(tokenizer), config.d_model)
+    #model = BlockRecurrentDecoder(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
+    model = LogLinearDecoder(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
     model.to(device)
-    posterior_model = BiTransformer(config, len(tokenizer), config.d_model)
+    posterior_model = BiTransformer(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
     posterior_model.to(device)
-    opt = AdamW([{'params': model.parameters(), 'lr': config.lr, 'max_lr': config.lr},
+    opt = AdamW([#{'params': model.parameters(), 'lr': config.lr, 'max_lr': config.lr},
                  {'params': upstream_model.parameters(), 'lr': config.lr, 'max_lr': config.lr},
-                 {'params': posterior_model.parameters(), 'lr': 0.2*config.lr, 'max_lr': 0.2*config.lr}],
+                 {'params': posterior_model.parameters(), 'lr': config.lr, 'max_lr': config.lr}],
                 betas=(config.adam_beta1, config.adam_beta2), weight_decay=0.01)
     
     # apex magic
@@ -132,15 +146,21 @@ def train(data, tokenizer, config):
     data_loader = DataLoader(train_data,  batch_size = config.batch_size, sampler = RandomSampler(train_data), pin_memory=True)
 
     train_loss = 0
+    recon_loss = 0
     
     generate(model, upstream_model, tokenizer, config)
     for batch_id, raw_batch in enumerate(tqdm(data_loader), 1):
         opt.zero_grad()
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
+        article_batch[:article_batch.size(0)//2, ::2] = 33
+        article_batch[:article_batch.size(0)//2, 1::2] = 39
+        article_batch[article_batch.size(0)//2:, ::2] = 39
+        article_batch[article_batch.size(0)//2:, 1::2] = 33
+        #article_batch[:, -1] = tokenizer.eos_token_id
         # manually specify h0
         prev_state = [model.h0.repeat(article_batch.size(0), 1, 1)]
-        hidden = (prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_model, )),
-                  prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_model, )))
+        hidden = (prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_latent, )),
+                  prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_latent, )))
         batch_loss = 0.
         if batch_id <= config.warmup:
             for param_group in opt.param_groups:
@@ -156,8 +176,8 @@ def train(data, tokenizer, config):
             #bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
             # run q(z|x)
             state_posterior = posterior_model(bos_text.cuda())[:, :config.state_len]
-            qz_mean = state_posterior[:, :, :config.d_model]
-            qz_logvar = state_posterior[:, :, config.d_model:]
+            qz_mean = state_posterior[:, :, :config.d_latent]
+            qz_logvar = state_posterior[:, :, config.d_latent:]
             # use z ~ q(z|x) to generate p(x|z)
             eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
             sampled_z = qz_mean + (0.5*qz_logvar).exp()*eps
@@ -167,8 +187,8 @@ def train(data, tokenizer, config):
             rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask])
             # prior matching loss KL(qz||pz)
             if config.state_len > 0:
-                pz_mean = prev_state[-1][:, :, :config.d_model]
-                pz_logvar = prev_state[-1][:, :, config.d_model:]
+                pz_mean = prev_state[-1][:, :, :config.d_latent]
+                pz_logvar = prev_state[-1][:, :, config.d_latent:]
                 prior_loss = 0.5 * ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp() - 1).sum(-1).mean()
             else:
                 prior_loss = 0.
@@ -176,19 +196,21 @@ def train(data, tokenizer, config):
             batch_loss += rec_loss+prior_loss
             #loss.backward(retain_graph=True)
             
-            train_loss += batch_loss.item()
+            train_loss += (rec_loss+prior_loss).item()
+            recon_loss += rec_loss.item()
         with amp.scale_loss(batch_loss / i, opt) as scaled_loss:
             scaled_loss.backward()
         opt.step()
         if batch_id % 100 == 0:
             ppl = valid(model, posterior_model, upstream_model, data, tokenizer, config)
-            print(f'Train loss: {train_loss / 10}')
+            print(f'Train recon loss: {recon_loss / 100}, Train loss: {train_loss / 100}')
             wandb.log(dict(
                 step=batch_id,
                 train_loss=train_loss,
                 valid_ppl=ppl,
             ))
             train_loss = 0
+            recon_loss = 0
         if batch_id >= config.max_updates:
             exit(0)
 
@@ -203,13 +225,18 @@ def valid(model, posterior_model, upstream_model, data, tokenizer, config, num_s
     total_tokens = 0
     for batch_id, raw_batch in enumerate(data_loader):
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
+        article_batch[:article_batch.size(0)//2, ::2] = 33
+        article_batch[:article_batch.size(0)//2, 1::2] = 39
+        article_batch[article_batch.size(0)//2:, ::2] = 39
+        article_batch[article_batch.size(0)//2:, 1::2] = 33
+        #article_batch[:, -1] = tokenizer.eos_token_id
         # manually specify h0
         prev_state = model.h0.repeat(article_batch.size(0), 1, 1)
-        hidden = (prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_model, )),
-                  prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_model, )))
+        hidden = (prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_latent, )),
+                  prev_state[0].new_zeros((config.lstm_layers, article_batch.size(0), config.d_latent, )))
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len)):
             # add eos token so the low-level model knows when to stop
-            bos_text = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
+            bos_text = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text], dim=-1).cuda()
             #bos_text_eos = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
             inputs = bos_text[:, :-1]
             inputs_mask = inputs != tokenizer.pad_token_id
@@ -218,8 +245,8 @@ def valid(model, posterior_model, upstream_model, data, tokenizer, config, num_s
             bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
             # run q(z|x)
             state_posterior = posterior_model(bos_text.cuda())[:, :config.state_len]
-            qz_mean = state_posterior[:, :, :config.d_model]
-            qz_logvar = state_posterior[:, :, config.d_model:]
+            qz_mean = state_posterior[:, :, :config.d_latent]
+            qz_logvar = state_posterior[:, :, config.d_latent:]
             if config.use_mean:
                 sampled_z = qz_mean
                 preds, _ = model(inputs, qz_mean)
@@ -233,8 +260,8 @@ def valid(model, posterior_model, upstream_model, data, tokenizer, config, num_s
             rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask], reduction='sum')
             # prior matching loss KL(qz||pz)
             if config.state_len > 0:
-                pz_mean = prev_state[:, :, :config.d_model]
-                pz_logvar = prev_state[:, :, config.d_model:]
+                pz_mean = prev_state[:, :, :config.d_latent]
+                pz_logvar = prev_state[:, :, config.d_latent:]
                 # here we can't ignore the constants in KL like during training
                 prior_loss = 0.5 * ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp() - 1).sum()
             else:
@@ -258,12 +285,12 @@ def generate(model, upstream_model, tokenizer, config):
     upstream_model.eval()
 
     prev_state = model.h0.repeat(1, 1, 1)
-    hidden = (prev_state[0].new_zeros((config.lstm_layers, 1, config.d_model, )),
-                prev_state[0].new_zeros((config.lstm_layers, 1, config.d_model, )))
+    hidden = (prev_state[0].new_zeros((config.lstm_layers, 1, config.d_latent, )),
+                prev_state[0].new_zeros((config.lstm_layers, 1, config.d_latent, )))
     decoded = []
     for i in range(10):
-        pz_mean = prev_state[:, :, :config.d_model]
-        pz_logvar = prev_state[:, :, config.d_model:]
+        pz_mean = prev_state[:, :, :config.d_latent]
+        pz_logvar = prev_state[:, :, config.d_latent:]
 
         eps = pz_mean.new(pz_mean.shape).normal_(0, 1)
         sampled_z = pz_mean + (0.5*pz_logvar).exp()*eps
@@ -291,7 +318,7 @@ if __name__ == '__main__':
     config = OmegaConf.load('configs/base.yaml')
 
     
-    wandb.init(project="Hierarchical-LM", entity="edwardhu", config=config, tags=[config.wandb_tag], mode="online")
+    wandb.init(project="Hierarchical-LM", entity="edwardhu", config=config, tags=[config.wandb_tag], mode="disabled")
     wandb.define_metric("train_loss", summary="min", step_metric='step')
     wandb.define_metric("valid_ppl", summary="min", step_metric='step')
 
