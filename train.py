@@ -273,9 +273,9 @@ def generate(model, upstream_model, tokenizer, config):
             bos_text = torch.cat([bos_text,
                                   preds[:, -1, :].softmax(dim=-1).multinomial(num_samples=1)], dim=-1).cuda()    
         prev_state, hidden = upstream_model(sampled_z, hidden)
-        decoded.append(bos_text[:, 1:])
+        decoded.append(tokenizer.decode(bos_text[0, 1:]))
 
-    print(tokenizer.decode(torch.cat(decoded, dim=-1)[0]))
+    print('|'.join(decoded))
 
     model.train()
     upstream_model.train()
