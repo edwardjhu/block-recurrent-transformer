@@ -199,58 +199,58 @@ class BlockRecurrentBlock(nn.Module):
         #self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim)
         
         self.input_self_attn = Attention(dim, heads = heads, causal = True, **attn_kwargs)
-        self.state_self_attn = Attention(dim_state, heads = heads, causal = False, **attn_kwargs)
+        #self.state_self_attn = Attention(dim_state, heads = heads, causal = False, **attn_kwargs)
 
-        self.input_state_cross_attn = Attention(dim, heads = heads, causal = False, **attn_kwargs)
-        self.state_input_cross_attn = Attention(dim_state, heads = heads, causal = False, **attn_kwargs)
+        #self.input_state_cross_attn = Attention(dim, heads = heads, causal = False, **attn_kwargs)
+        #self.state_input_cross_attn = Attention(dim_state, heads = heads, causal = False, **attn_kwargs)
 
-        self.proj_gate = RecurrentStateGate(dim)
-        self.ff_gate = RecurrentStateGate(dim)
+        #self.proj_gate = RecurrentStateGate(dim)
+        #self.ff_gate = RecurrentStateGate(dim)
 
-        self.input_proj = nn.Linear(dim + dim_state, dim, bias = False)
-        if config.bottom_up:
-            self.state_proj = nn.Linear(dim + dim_state, dim, bias = False)
-        else:
-            self.state_proj = nn.Linear(dim, dim, bias = False)
+        self.input_proj = nn.Linear(dim, dim, bias = False)
+        #if config.bottom_up:
+        #    self.state_proj = nn.Linear(dim + dim_state, dim, bias = False)
+        #else:
+        #    self.state_proj = nn.Linear(dim, dim, bias = False)
 
         self.input_ff = FeedForward(dim)
-        self.state_ff = FeedForward(dim_state)
+        #self.state_ff = FeedForward(dim_state)
 
     @typechecked
     def forward(
         self,
         x: SeqTensor,
-        state: Optional[StateTensor] = None,
+        state: StateTensor,
         mask = None,
         state_mask = None
     ) -> Tuple[SeqTensor, StateTensor]:
         batch, seq_len, device = x.shape[0], x.shape[-2], x.device
-        if not exists(state):
-            state = torch.zeros((batch, self.state_len, self.dim_state), device=device)
+        x = torch.cat([state, x], dim=1)
         #self_attn_pos_emb = self.rotary_pos_emb(seq_len, device = device)
         #state_pos_emb = self.rotary_pos_emb(self.state_len, device = device)
         input_attn = self.input_self_attn(x, mask = mask) #, pos_emb = self_attn_pos_emb)
-        state_attn = self.state_self_attn(state, mask = state_mask) #, pos_emb = state_pos_emb)
+        #state_attn = self.state_self_attn(state, mask = state_mask) #, pos_emb = state_pos_emb)
 
         # TODO: This is different from how it is implemented in the paper, because the Keys and Values aren't shared
         # between the cross attention and self-attention. I'll implement that later, this is faster for now.
-        input_as_q_cross_attn = self.input_state_cross_attn(x, context = state, mask = mask)
-        projected_input = self.input_proj(torch.concat((input_as_q_cross_attn, input_attn), dim=2))
-        if self.config.bottom_up:
-            state_as_q_cross_attn = self.state_input_cross_attn(state, context = x, mask = state_mask)
-            projected_state = self.state_proj(torch.concat((state_as_q_cross_attn, state_attn), dim=2))
-        else:
-            projected_state = self.state_proj(state_attn)
+        #input_as_q_cross_attn = self.input_state_cross_attn(x, context = state, mask = mask)
+        #projected_input = self.input_proj(torch.concat((input_as_q_cross_attn, input_attn), dim=2))
+        projected_input = self.input_proj(input_attn)
+        #if self.config.bottom_up:
+        #    state_as_q_cross_attn = self.state_input_cross_attn(state, context = x, mask = state_mask)
+        #    projected_state = self.state_proj(torch.concat((state_as_q_cross_attn, state_attn), dim=2))
+        #else:
+        #    projected_state = self.state_proj(state_attn)
 
         input_residual = projected_input + x
-        state_residual = self.proj_gate(projected_state, state)
+        #state_residual = self.proj_gate(projected_state, state)
         #state_residual = projected_state + state
 
         output = self.input_ff(input_residual) + input_residual
-        next_state = self.ff_gate(self.state_ff(state_residual), state_residual)
+        #next_state = self.ff_gate(self.state_ff(state_residual), state_residual)
         #next_state = self.state_ff(state_residual) + state_residual
 
-        return output, next_state
+        return output[:,state.size(1):,:], state
 
 
 class VanillaTransformerBlock(nn.Module):
