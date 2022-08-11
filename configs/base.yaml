@@ -1,8 +1,9 @@
-seed: 47
+seed: 48
 # training
-window_len: 1
-batch_size: 2
+window_len: 5
+batch_size: 64
 warmup: 100
+gclip: 1
 lr: 0.001
 adam_beta1: 0.9
 adam_beta2: 0.98
@@ -11,9 +12,9 @@ max_updates: 5000
 use_mean: False
 # architecture
 d_model: 512
-d_latent: 2
+d_latent: 32
 num_layers: 4
-lstm_layers: 3
+lstm_layers: 1
 state_len: 1
-bottom_up: True
+bottom_up: False
 wandb_tag: lstm

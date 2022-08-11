@@ -18,7 +18,7 @@ from block_recurrent_transformer.transformer import VanillaTransformerBlock
 from apex import amp
 
 class WikiDataset:
-    def __init__(self, data, max_char=25):
+    def __init__(self, data, max_char=100):
         self.data = data
         self.max_char = max_char
     
@@ -26,7 +26,7 @@ class WikiDataset:
         record = self.data[i]
         title = record['title']
         text = record['text']
-        return f'{title}\n\n{text}'[:self.max_char] + ' [EOS]'
+        return f'{title}\n\n{text}'[:self.max_char] + ' [PAD]'
     
     def __len__(self):
         return len(self.data)
@@ -84,9 +84,16 @@ class BiTransformer(nn.Module):
                                         for _ in range(config.num_layers)])
         self.norm = nn.LayerNorm(dim)
         self.to_gaussian = nn.Linear(dim, 2*d_latent)
+        self.decode_latent = nn.Linear(d_latent, dim)
     
-    def forward(self, x):
+    def forward(self, x, state=None):
         x = self.embed(x) + self.pos_embed(x)
+        if state is not None:
+            latent = self.decode_latent(state)
+            #latent = x.new_zeros((x.size(0), 1, x.size(-1)))
+        else:
+            latent = x.new_zeros((x.size(0), 1, x.size(-1)))
+        x = torch.cat([x[:, :config.state_len, :], latent, x[:, config.state_len:, :]], dim=1)
         for layer in self.layers:
             x = layer(x)
         x = self.to_gaussian(self.norm(x))
@@ -153,6 +160,7 @@ def setup_tokenizer():
 
 from itertools import chain
 def train(data, tokenizer, config):
+    global_step = 0
     upstream_model = UpstreamLSTM(config.d_latent, num_layers=config.lstm_layers)
     #upstream_model = UpstreamLSTMDiscrete(len(tokenizer), config.d_latent, num_layers=config.lstm_layers)
     #upstream_model = UpstreamTransformer(config, len(tokenizer), config.d_latent)
@@ -165,8 +173,24 @@ def train(data, tokenizer, config):
     opt = AdamW([{'params': model.parameters(), 'lr': config.lr, 'max_lr': config.lr},
                  {'params': posterior_model.parameters(), 'lr': config.lr, 'max_lr': config.lr}],
                 betas=(config.adam_beta1, config.adam_beta2), weight_decay=0.0)
-    opt1 = AdamW([{'params': upstream_model.parameters(), 'lr': 0.01, 'max_lr': 0.01}], weight_decay=0.0)
+    opt1 = AdamW([{'params': upstream_model.parameters(), 'lr': 0.001, 'max_lr': 0.001}], weight_decay=0.0)
     
+    # cyclical annealing
+    import numpy as np
+    def frange_cycle_linear(n_iter, start=0.0, stop=1.0, n_cycle=4, ratio=0.5):
+        L = np.ones(n_iter) * stop
+        period = n_iter/n_cycle
+        step = (stop-start)/(period*ratio) # linear schedule
+
+        for c in range(n_cycle):
+            v, i = start, 0
+            while v <= stop and (int(i+c*period) < n_iter):
+                L[int(i+c*period)] = v
+                v += step
+                i += 1
+        return L 
+    annealing_sched = frange_cycle_linear(config.max_updates, start=0.0, stop=1.0, n_cycle=10)
+
     # apex magic
     models, opts = amp.initialize(
         [model, posterior_model, upstream_model],
@@ -191,17 +215,21 @@ def train(data, tokenizer, config):
         opt.zero_grad()
         opt1.zero_grad()
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
+        
         article_batch[:article_batch.size(0)//2, ::2] = 33
         article_batch[:article_batch.size(0)//2, 1::2] = 39
         article_batch[article_batch.size(0)//2:, ::2] = 39
         article_batch[article_batch.size(0)//2:, 1::2] = 33
+        
         #article_batch[:, -1] = tokenizer.eos_token_id
         # manually specify h0
         prev_state = [upstream_model.h0.repeat(article_batch.size(0), 1, 1)]
         hidden = (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_latent, )),
                   prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_latent, )))
+        sampled_z = None
         #hidden = prev_state[0].new_ones((article_batch.size(0), 0, config.d_latent))
-        batch_loss = 0.
+        batch_rec_loss = 0.
+        batch_prior_loss = 0.
         if batch_id <= config.warmup:
             for param_group in opt.param_groups:
                 param_group['lr'] = param_group['max_lr'] * batch_id / config.warmup
@@ -212,12 +240,12 @@ def train(data, tokenizer, config):
             #bos_text_eos = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
             bos_text = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text], dim=-1).cuda()
             inputs = bos_text[:, :-1]
-            inputs_mask = inputs != tokenizer.pad_token_id
             targets = bos_text[:, 1:]
+            inputs_mask = (inputs != tokenizer.pad_token_id) & (targets != tokenizer.pad_token_id)
             # add bos token so our BERT can use it to summarize the block
             #bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
             # run q(z|x)
-            state_posterior = posterior_model(bos_text.cuda())[:, :config.state_len]
+            state_posterior = posterior_model(bos_text, state=sampled_z)[:, :config.state_len]
             qz_mean = state_posterior[:, :, :config.d_latent]
             qz_logvar = state_posterior[:, :, config.d_latent:]
             # use z ~ q(z|x) to generate p(x|z)
@@ -233,23 +261,35 @@ def train(data, tokenizer, config):
                 pz_mean = prev_state[-1][:, :, :config.d_latent]
                 pz_logvar = prev_state[-1][:, :, config.d_latent:]
                 prior_loss = 0.5 * ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp() - 1).sum(-1).mean()
+                #prior_reg = 0.001*(0.5 * ((-qz_logvar) + (qz_logvar.exp()+(qz_mean)**2) - 1).sum(-1).mean())
+                prior_reg = 0.001*(0.5 * ((-qz_logvar) + (qz_logvar.exp()+(qz_mean)**2) - 1).sum(-1).mean())
                 #prior_loss = ((qz_mean.detach() - pz_mean)**2).sum(-1).mean()
                 #prior_loss = ((pz_logvar-qz_logvar.detach())**2 + (qz_mean.detach() - pz_mean)**2).sum(-1).mean()
             else:
                 prior_loss = 0.
             prev_state.append(state)
-            batch_loss += rec_loss+prior_loss
+            #if rec_loss > 1:
+            #    batch_rec_loss += rec_loss #+prior_reg
+            #else:
+            batch_rec_loss += rec_loss
+            batch_prior_loss += prior_loss #+prior_reg
             #loss.backward(retain_graph=True)
             
             train_loss += (rec_loss+prior_loss).item()
             recon_loss += rec_loss.item()
-        with amp.scale_loss(batch_loss, [opt, opt1]) as scaled_loss:
-            scaled_loss.backward() 
+        #with amp.scale_loss(batch_loss, [opt, opt1]) as scaled_loss:
+        #    scaled_loss.backward()
+        #if type(batch_prior_loss) is torch.Tensor:
+        #    (annealing_sched[global_step]*batch_prior_loss).backward(retain_graph=True)
+        #torch.nn.utils.clip_grad_norm_(chain(amp.master_params(opt),
+        #                                    amp.master_params(opt1)), config.gclip)
+        (0.2*annealing_sched[global_step]*batch_prior_loss + batch_rec_loss).backward()
         torch.nn.utils.clip_grad_norm_(chain(amp.master_params(opt),
                                             amp.master_params(opt1)), config.gclip)
         opt.step()
         opt1.step()
-        if batch_id % 20 == 0:
+        global_step += 1
+        if batch_id % 100 == 0:
             ppl = valid(model, posterior_model, upstream_model, data, tokenizer, config)
             print(f'Train recon loss: {recon_loss / 100}, Train loss: {train_loss / 100}')
             wandb.log(dict(
@@ -274,15 +314,18 @@ def valid(model, posterior_model, upstream_model, data, tokenizer, config, num_s
     total_tokens = 0
     for batch_id, raw_batch in enumerate(data_loader):
         article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
+        
         article_batch[:article_batch.size(0)//2, ::2] = 33
         article_batch[:article_batch.size(0)//2, 1::2] = 39
         article_batch[article_batch.size(0)//2:, ::2] = 39
         article_batch[article_batch.size(0)//2:, 1::2] = 33
+        
         #article_batch[:, -1] = tokenizer.eos_token_id
         # manually specify h0
         prev_state = upstream_model.h0.repeat(article_batch.size(0), 1, 1)
         hidden = (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_latent, )),
                   prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_latent, )))
+        sampled_z = None
         #hidden = prev_state[0].new_ones((article_batch.size(0), 0, config.d_latent))
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len)):
             # add eos token so the low-level model knows when to stop
@@ -294,7 +337,7 @@ def valid(model, posterior_model, upstream_model, data, tokenizer, config, num_s
             # add bos token so our BERT can use it to summarize the block
             bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
             # run q(z|x)
-            state_posterior = posterior_model(bos_text.cuda())[:, :config.state_len]
+            state_posterior = posterior_model(bos_text.cuda(), state=sampled_z)[:, :config.state_len]
             qz_mean = state_posterior[:, :, :config.d_latent]
             qz_logvar = state_posterior[:, :, config.d_latent:]
             if config.use_mean:
