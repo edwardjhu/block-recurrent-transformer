@@ -18,7 +18,7 @@ from block_recurrent_transformer.transformer import VanillaTransformerBlock
 from apex import amp
 
 class WikiDataset:
-    def __init__(self, data, max_char=100):
+    def __init__(self, data, max_char=500):
         self.data = data
         self.max_char = max_char
     
@@ -26,7 +26,7 @@ class WikiDataset:
         record = self.data[i]
         title = record['title']
         text = record['text']
-        return f'{title}\n\n{text}'[:self.max_char] + ' [PAD]'
+        return f'{title}\n\n{text}'[:self.max_char]
     
     def __len__(self):
         return len(self.data)
@@ -103,16 +103,16 @@ class UpstreamLSTM(nn.Module):
     """As simple as I can make the model.
     """
 
-    def __init__(self, dim, num_layers):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super().__init__()
-        self.lstm = nn.LSTM(dim, dim, num_layers=num_layers, batch_first=True)
-        self.h0 = nn.Parameter(torch.zeros(1, config.state_len, 2*dim))
-        self.to_gaussian = nn.Linear(dim, 2*dim)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+        self.h0 = nn.Parameter(torch.zeros(1, config.state_len, 2*output_dim))
+        self.to_output = nn.Linear(hidden_dim, 2*output_dim)
     
     def forward(self, x, hidden):
         if x.size(1) > 0:
             out, hidden = self.lstm(x, hidden)
-            out = self.to_gaussian(out)
+            out = self.to_output(out)
             return out, hidden
         return x.repeat(1, 1, 2), hidden
 
@@ -159,21 +159,43 @@ def setup_tokenizer():
     return tokenizer
 
 from itertools import chain
-def train(data, tokenizer, config):
+def train(data, tokenizer_posterior, tokenizer_decoder, config):
     global_step = 0
-    upstream_model = UpstreamLSTM(config.d_latent, num_layers=config.lstm_layers)
+    upstream_model = UpstreamLSTM(input_dim=config.d_latent,
+                                  hidden_dim=config.d_model,
+                                  output_dim=config.d_latent,
+                                  num_layers=config.lstm_layers)
     #upstream_model = UpstreamLSTMDiscrete(len(tokenizer), config.d_latent, num_layers=config.lstm_layers)
     #upstream_model = UpstreamTransformer(config, len(tokenizer), config.d_latent)
     upstream_model.to(device)
-    model = BlockRecurrentDecoder(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
+
+    posterior_lstm = UpstreamLSTM(input_dim=config.d_model,
+                                  hidden_dim=config.d_model,
+                                  output_dim=config.d_latent,
+                                  num_layers=config.lstm_layers)
+    #upstream_model = UpstreamLSTMDiscrete(len(tokenizer), config.d_latent, num_layers=config.lstm_layers)
+    #upstream_model = UpstreamTransformer(config, len(tokenizer), config.d_latent)
+    posterior_lstm.to(device)
+
+    #model = BlockRecurrentDecoder(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
     #model = LogLinearDecoder(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
+    from transformers_overrides import OPTForCausalLM_ours
+    model = OPTForCausalLM_ours.from_pretrained('facebook/opt-125m', d_latent=config.d_latent)
     model.to(device)
-    posterior_model = BiTransformer(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
+    for p in model.parameters():
+        p.requires_grad = False
+    model.z_to_hidden.weight.requires_grad = True
+    model.z_to_hidden.bias.requires_grad = True
+
+    #posterior_model = BiTransformer(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
+    posterior_model = RobertaModel.from_pretrained('roberta-base')
     posterior_model.to(device)
-    opt = AdamW([{'params': model.parameters(), 'lr': config.lr, 'max_lr': config.lr},
-                 {'params': posterior_model.parameters(), 'lr': config.lr, 'max_lr': config.lr}],
+    for p in posterior_model.parameters():
+        p.requires_grad = False
+    opt = AdamW([{'params': chain(upstream_model.parameters(), [model.z_to_hidden.weight, model.z_to_hidden.bias, ]), 'lr': config.lr, 'max_lr': config.lr}],
                 betas=(config.adam_beta1, config.adam_beta2), weight_decay=0.0)
-    opt1 = AdamW([{'params': upstream_model.parameters(), 'lr': 0.001, 'max_lr': 0.001}], weight_decay=0.0)
+    opt1 = AdamW([{'params': posterior_lstm.parameters(), 'lr': config.lr, 'max_lr': config.lr}],
+                betas=(config.adam_beta1, config.adam_beta2), weight_decay=0.0)
     
     # cyclical annealing
     import numpy as np
@@ -214,18 +236,22 @@ def train(data, tokenizer, config):
     for batch_id, raw_batch in enumerate(tqdm(data_loader), 1):
         opt.zero_grad()
         opt1.zero_grad()
-        article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
-        
+        article_batch = tokenizer_decoder(raw_batch, return_tensors='pt', padding=True)['input_ids']
+        article_batch = article_batch.cuda()
+        '''
         article_batch[:article_batch.size(0)//2, ::2] = 33
         article_batch[:article_batch.size(0)//2, 1::2] = 39
         article_batch[article_batch.size(0)//2:, ::2] = 39
         article_batch[article_batch.size(0)//2:, 1::2] = 33
-        
+        '''
         #article_batch[:, -1] = tokenizer.eos_token_id
         # manually specify h0
         prev_state = [upstream_model.h0.repeat(article_batch.size(0), 1, 1)]
-        hidden = (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_latent, )),
-                  prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_latent, )))
+        hidden = (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )),
+                  prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )))
+        hidden_posterior = \
+                 (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )),
+                  prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )))
         sampled_z = None
         #hidden = prev_state[0].new_ones((article_batch.size(0), 0, config.d_latent))
         batch_rec_loss = 0.
@@ -238,21 +264,27 @@ def train(data, tokenizer, config):
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len)):
             # add eos token so the low-level model knows when to stop
             #bos_text_eos = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
-            bos_text = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text], dim=-1).cuda()
-            inputs = bos_text[:, :-1]
-            targets = bos_text[:, 1:]
-            inputs_mask = (inputs != tokenizer.pad_token_id) & (targets != tokenizer.pad_token_id)
+            bos_text_decoder = torch.cat([text.new_ones(text.size(0), 1)*tokenizer_decoder.bos_token_id, text], dim=-1)
+            inputs = bos_text_decoder[:, :-1]
+            targets = bos_text_decoder[:, 1:]
+            inputs_mask = (inputs != tokenizer_decoder.pad_token_id) & (targets != tokenizer_decoder.pad_token_id)
+            bos_text_eos_posterior = torch.cat([text.new_ones(text.size(0), 1)*tokenizer_posterior.bos_token_id,
+                                                text,
+                                                text.new_ones(text.size(0), 1)*tokenizer_posterior.eos_token_id], dim=-1)
             # add bos token so our BERT can use it to summarize the block
             #bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
             # run q(z|x)
-            state_posterior = posterior_model(bos_text, state=sampled_z)[:, :config.state_len]
+            pooled_posterior = posterior_model(bos_text_eos_posterior)['pooler_output']
+            state_posterior, hidden_posterior = posterior_lstm(pooled_posterior.unsqueeze(1), hidden_posterior)
+
             qz_mean = state_posterior[:, :, :config.d_latent]
             qz_logvar = state_posterior[:, :, config.d_latent:]
             # use z ~ q(z|x) to generate p(x|z)
             eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
             torch.nn.init.trunc_normal_(eps)
             sampled_z = qz_mean + (0.5*qz_logvar).exp()*eps
-            preds, _ = model(inputs, sampled_z)
+            preds = model(inputs_embeds=torch.cat([model.z_to_hidden(sampled_z),
+                                model.get_input_embeddings()(inputs)], dim=1))['logits'][:,1:,:]
             state, hidden = upstream_model(sampled_z, hidden)
             # reconstruction loss
             rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask])
@@ -283,15 +315,18 @@ def train(data, tokenizer, config):
         #    (annealing_sched[global_step]*batch_prior_loss).backward(retain_graph=True)
         #torch.nn.utils.clip_grad_norm_(chain(amp.master_params(opt),
         #                                    amp.master_params(opt1)), config.gclip)
-        (0.2*annealing_sched[global_step]*batch_prior_loss + batch_rec_loss).backward()
+        #(0.2*annealing_sched[global_step]*batch_prior_loss + batch_rec_loss).backward()
+        (batch_prior_loss + batch_rec_loss).backward()
         torch.nn.utils.clip_grad_norm_(chain(amp.master_params(opt),
                                             amp.master_params(opt1)), config.gclip)
         opt.step()
         opt1.step()
         global_step += 1
-        if batch_id % 100 == 0:
-            ppl = valid(model, posterior_model, upstream_model, data, tokenizer, config)
-            print(f'Train recon loss: {recon_loss / 100}, Train loss: {train_loss / 100}')
+        log_freq = 50
+        if batch_id % log_freq == 0:
+            ppl = valid(model, posterior_model, upstream_model, posterior_lstm,
+                        data, tokenizer_posterior, tokenizer_decoder, config)
+            print(f'Train recon loss: {recon_loss / log_freq}, Train loss: {train_loss / log_freq}')
             wandb.log(dict(
                 step=batch_id,
                 train_loss=train_loss,
@@ -303,51 +338,61 @@ def train(data, tokenizer, config):
             exit(0)
 
 @torch.no_grad()
-def valid(model, posterior_model, upstream_model, data, tokenizer, config, num_samples=10):
+def valid(model, posterior_model, upstream_model, posterior_lstm, 
+          data, tokenizer_posterior, tokenizer_decoder, config, num_samples=10):
     model.eval()
     posterior_model.eval()
     upstream_model.eval()
+    posterior_lstm.eval()
     valid_data = WikiDataset(data['train'])
     data_loader = DataLoader(valid_data,  batch_size=config.batch_size, pin_memory=True)
     valid_loss = 0.
     recon_loss = 0.
     total_tokens = 0
     for batch_id, raw_batch in enumerate(data_loader):
-        article_batch = tokenizer(raw_batch, return_tensors='pt', padding=True)['input_ids']
-        
+        article_batch = tokenizer_decoder(raw_batch, return_tensors='pt', padding=True)['input_ids']
+        article_batch = article_batch.cuda()
+        '''
         article_batch[:article_batch.size(0)//2, ::2] = 33
         article_batch[:article_batch.size(0)//2, 1::2] = 39
         article_batch[article_batch.size(0)//2:, ::2] = 39
         article_batch[article_batch.size(0)//2:, 1::2] = 33
-        
+        '''
         #article_batch[:, -1] = tokenizer.eos_token_id
         # manually specify h0
         prev_state = upstream_model.h0.repeat(article_batch.size(0), 1, 1)
-        hidden = (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_latent, )),
-                  prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_latent, )))
+        hidden = (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )),
+                  prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )))
+        hidden_posterior = \
+                 (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )),
+                  prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )))
         sampled_z = None
         #hidden = prev_state[0].new_ones((article_batch.size(0), 0, config.d_latent))
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len)):
             # add eos token so the low-level model knows when to stop
-            bos_text = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text], dim=-1).cuda()
-            #bos_text_eos = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
-            inputs = bos_text[:, :-1]
-            inputs_mask = inputs != tokenizer.pad_token_id
-            targets = bos_text[:, 1:]
-            # add bos token so our BERT can use it to summarize the block
-            bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
+            bos_text_decoder = torch.cat([text.new_ones(text.size(0), 1)*tokenizer_decoder.bos_token_id, text], dim=-1)
+            inputs = bos_text_decoder[:, :-1]
+            targets = bos_text_decoder[:, 1:]
+            inputs_mask = (inputs != tokenizer_decoder.pad_token_id) & (targets != tokenizer_decoder.pad_token_id)
+            bos_text_eos_posterior = torch.cat([text.new_ones(text.size(0), 1)*tokenizer_posterior.bos_token_id,
+                                                text,
+                                                text.new_ones(text.size(0), 1)*tokenizer_posterior.eos_token_id], dim=-1)
             # run q(z|x)
-            state_posterior = posterior_model(bos_text.cuda(), state=sampled_z)[:, :config.state_len]
+            pooled_posterior = posterior_model(bos_text_eos_posterior)['pooler_output']
+            state_posterior, hidden_posterior = posterior_lstm(pooled_posterior.unsqueeze(1), hidden_posterior)
+
             qz_mean = state_posterior[:, :, :config.d_latent]
             qz_logvar = state_posterior[:, :, config.d_latent:]
             if config.use_mean:
                 sampled_z = qz_mean
-                preds, _ = model(inputs, qz_mean)
+                preds = model(inputs_embeds=torch.cat([model.z_to_hidden(sampled_z),
+                              model.get_input_embeddings()(inputs)], dim=1))['logits'][:,1:,:]
             else:
                 eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
                 torch.nn.init.trunc_normal_(eps)
                 sampled_z = qz_mean + (0.5*qz_logvar).exp()*eps
-                preds, _ = model(inputs, sampled_z)
+                preds = model(inputs_embeds=torch.cat([model.z_to_hidden(sampled_z),
+                              model.get_input_embeddings()(inputs)], dim=1))['logits'][:,1:,:]
             state, hidden = upstream_model(sampled_z, hidden)
             # use z ~ q(z|x) to generate p(x|z)
             # reconstruction loss
@@ -367,10 +412,11 @@ def valid(model, posterior_model, upstream_model, data, tokenizer, config, num_s
         if batch_id == num_samples:
             break
     print(f'Recon PPL: {2.71828**(recon_loss/total_tokens)}, Valid PPL: {2.71828**(valid_loss/total_tokens)}')
-    generate(model, upstream_model, tokenizer, config)
-    model.train()
-    posterior_model.train()
+    generate(model, upstream_model, tokenizer_decoder, config)
+    #model.train()
+    #posterior_model.train()
     upstream_model.train()
+    posterior_lstm.train()
     return 2.**(valid_loss/total_tokens)
 
 
@@ -380,8 +426,8 @@ def generate(model, upstream_model, tokenizer, config):
     upstream_model.eval()
 
     prev_state = upstream_model.h0.repeat(1, 1, 1)
-    hidden = (prev_state[0].new_ones((config.lstm_layers, 1, config.d_latent, )),
-              prev_state[0].new_ones((config.lstm_layers, 1, config.d_latent, )))
+    hidden = (prev_state[0].new_ones((config.lstm_layers, 1, config.d_model, )),
+              prev_state[0].new_ones((config.lstm_layers, 1, config.d_model, )))
     #hidden = prev_state[0].new_ones((1, 0, config.d_latent))
     decoded = []
     for i in range(10):
@@ -393,15 +439,18 @@ def generate(model, upstream_model, tokenizer, config):
         sampled_z = pz_mean + (0.5*pz_logvar).exp()*eps
         bos_text = (pz_mean.new_ones(pz_mean.size(0), 1)*tokenizer.bos_token_id).long().cuda()
         for _ in range(config.window_len):
-            preds, _ = model(bos_text, sampled_z)
+            preds = model(inputs_embeds=torch.cat([model.z_to_hidden(sampled_z),
+                          model.get_input_embeddings()(bos_text)], dim=1))['logits'][:,1:,:]
+            #bos_text = torch.cat([bos_text,
+            #                      preds[:, -1, :].softmax(dim=-1).multinomial(num_samples=1)], dim=-1).cuda()    
             bos_text = torch.cat([bos_text,
-                                  preds[:, -1, :].softmax(dim=-1).multinomial(num_samples=1)], dim=-1).cuda()    
+                                  preds[:, -1:, :].argmax(dim=-1)], dim=-1).cuda()    
         prev_state, hidden = upstream_model(sampled_z, hidden)
         decoded.append(tokenizer.decode(bos_text[0, 1:]))
 
     print('|'.join(decoded))
 
-    model.train()
+    #model.train()
     upstream_model.train()
 
 
@@ -411,9 +460,17 @@ if __name__ == '__main__':
     #data = load_from_disk("/home/v-edwardhu/.cache/huggingface/datasets/wikipedia/20220301.en.min10000/train")
     data.filter(lambda x : len(x['text'])>10000)
 
-    tokenizer = setup_tokenizer()
+    #tokenizer = setup_tokenizer()
     config = OmegaConf.load('configs/base.yaml')
 
+    from transformers import RobertaTokenizer, RobertaModel, GPT2Tokenizer, OPTForCausalLM
+
+    tokenizer_posterior = RobertaTokenizer.from_pretrained('roberta-base')
+    tokenizer_decoder = GPT2Tokenizer.from_pretrained('facebook/opt-125m', add_bos_token=False)
+
+    
+
+    #last_hidden_states = outputs.last_hidden_state
     
     wandb.init(project="Hierarchical-LM", entity="edwardhu", config=config, tags=[config.wandb_tag], mode="disabled")
     wandb.define_metric("train_loss", summary="min", step_metric='step')
@@ -421,5 +478,5 @@ if __name__ == '__main__':
 
     torch.manual_seed(config.seed)
 
-    train(data, tokenizer, config)
+    train(data, tokenizer_posterior, tokenizer_decoder, config)
     

@@ -11,7 +11,7 @@ max_updates: 5000
 # eval
 use_mean: False
 # architecture
-d_model: 512
+d_model: 768
 d_latent: 32
 num_layers: 4
 lstm_layers: 1
