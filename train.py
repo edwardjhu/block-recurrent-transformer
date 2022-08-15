@@ -11,6 +11,8 @@ from transformers import AdamW, GPT2Tokenizer
 from x_transformers.x_transformers import TokenEmbedding, AbsolutePositionalEmbedding
 import wandb
 
+import os
+
 from block_recurrent_transformer import BlockRecurrentBlock, long_sequence_splitter
 from block_recurrent_transformer.transformer import VanillaTransformerBlock
 
@@ -18,7 +20,7 @@ from block_recurrent_transformer.transformer import VanillaTransformerBlock
 from apex import amp
 
 class WikiDataset:
-    def __init__(self, data, max_char=500):
+    def __init__(self, data, max_char=640):
         self.data = data
         self.max_char = max_char
     
@@ -136,21 +138,23 @@ class UpstreamTransformer(nn.Module):
     """As simple as I can make the model.
     """
 
-    def __init__(self, config, num_tokens, dim):
+    def __init__(self, config, input_dim, hidden_dim, output_dim):
         super().__init__()
-        self.layers = nn.ModuleList([VanillaTransformerBlock(config, dim) \
+        self.layers = nn.ModuleList([VanillaTransformerBlock(config, hidden_dim) \
                                         for _ in range(config.num_layers)])
-        self.pos_embed = AbsolutePositionalEmbedding(dim, 999)
-        self.norm = nn.LayerNorm(dim)
-        self.to_gaussian = nn.Linear(dim, 2*dim)
+        self.pos_embed = AbsolutePositionalEmbedding(hidden_dim, 999)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.to_gaussian = nn.Linear(hidden_dim, 2*output_dim)
+        self.z_to_hidden = nn.Linear(input_dim, hidden_dim)
+        self.h0 = nn.Parameter(torch.zeros(1, config.state_len, 2*output_dim))
         self.state_len = config.state_len
     
     def forward(self, x, hidden):
         x = torch.cat([hidden, x], dim=1)
-        out = x + self.pos_embed(x[:,:,-1])
+        out = self.z_to_hidden(x) + self.pos_embed(x[:,:,-1])
         for layer in self.layers:
             out = layer(out)
-        return self.to_gaussian(self.norm(out[:, -self.state_len:, :])), x
+        return self.to_gaussian(out[:, -self.state_len:, :]), x
 
 
 def setup_tokenizer():
@@ -161,12 +165,16 @@ def setup_tokenizer():
 from itertools import chain
 def train(data, tokenizer_posterior, tokenizer_decoder, config):
     global_step = 0
+    global_recon_step = 0
     upstream_model = UpstreamLSTM(input_dim=config.d_latent,
                                   hidden_dim=config.d_model,
                                   output_dim=config.d_latent,
                                   num_layers=config.lstm_layers)
     #upstream_model = UpstreamLSTMDiscrete(len(tokenizer), config.d_latent, num_layers=config.lstm_layers)
-    #upstream_model = UpstreamTransformer(config, len(tokenizer), config.d_latent)
+    #upstream_model = UpstreamTransformer(config,
+    #                                    input_dim=config.d_latent,
+    #                                    hidden_dim=config.d_model,
+    #                                    output_dim=config.d_latent)
     upstream_model.to(device)
 
     posterior_lstm = UpstreamLSTM(input_dim=config.d_model,
@@ -177,24 +185,32 @@ def train(data, tokenizer_posterior, tokenizer_decoder, config):
     #upstream_model = UpstreamTransformer(config, len(tokenizer), config.d_latent)
     posterior_lstm.to(device)
 
-    #model = BlockRecurrentDecoder(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
-    #model = LogLinearDecoder(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
-    from transformers_overrides import OPTForCausalLM_ours
-    model = OPTForCausalLM_ours.from_pretrained('facebook/opt-125m', d_latent=config.d_latent)
+    if os.path.exists(config.load_decoder):
+        model = torch.load(config.load_decoder)
+    else:
+        #model = BlockRecurrentDecoder(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
+        #model = LogLinearDecoder(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
+        from transformers_overrides import OPTForCausalLM_ours
+        model = OPTForCausalLM_ours.from_pretrained('facebook/opt-125m', d_latent=config.d_latent)
+    
     model.to(device)
-    for p in model.parameters():
-        p.requires_grad = False
-    model.z_to_hidden.weight.requires_grad = True
-    model.z_to_hidden.bias.requires_grad = True
-
-    #posterior_model = BiTransformer(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
-    posterior_model = RobertaModel.from_pretrained('roberta-base')
+    #for p in model.parameters():
+    #    p.requires_grad = False
+    #model.z_to_hidden.weight.requires_grad = True
+    #model.z_to_hidden.bias.requires_grad = True
+    
+    if os.path.exists(config.load_posterior):
+        posterior_model = torch.load(config.load_posterior)
+    else:
+        #posterior_model = BiTransformer(config, len(tokenizer), config.d_model, d_latent=config.d_latent)
+        posterior_model = RobertaModel.from_pretrained('roberta-base')
     posterior_model.to(device)
-    for p in posterior_model.parameters():
-        p.requires_grad = False
-    opt = AdamW([{'params': chain(upstream_model.parameters(), [model.z_to_hidden.weight, model.z_to_hidden.bias, ]), 'lr': config.lr, 'max_lr': config.lr}],
+    #for p in posterior_model.parameters():
+    #    p.requires_grad = False
+
+    opt = AdamW([{'params': chain(posterior_model.parameters(), model.parameters()), 'lr': config.lr, 'max_lr': config.lr}],
                 betas=(config.adam_beta1, config.adam_beta2), weight_decay=0.0)
-    opt1 = AdamW([{'params': posterior_lstm.parameters(), 'lr': config.lr, 'max_lr': config.lr}],
+    opt1 = AdamW([{'params': chain(upstream_model.parameters()), 'lr': 4*config.lr, 'max_lr': 4*config.lr}],
                 betas=(config.adam_beta1, config.adam_beta2), weight_decay=0.0)
     
     # cyclical annealing
@@ -211,32 +227,18 @@ def train(data, tokenizer_posterior, tokenizer_decoder, config):
                 v += step
                 i += 1
         return L 
-    annealing_sched = frange_cycle_linear(config.max_updates, start=0.0, stop=1.0, n_cycle=10)
+    annealing_sched = frange_cycle_linear(config.max_updates, start=0.0, stop=1.0, n_cycle=5)
 
-    # apex magic
-    models, opts = amp.initialize(
-        [model, posterior_model, upstream_model],
-        [opt, opt1],
-        opt_level='O0',
-        )
-    model = models[0]
-    posterior_model = models[1]
-    upstream_model = models[2]
-
-    opt = opts[0]
-    opt1 = opts[1]
-    
     train_data = WikiDataset(data['train'])
     data_loader = DataLoader(train_data,  batch_size = config.batch_size, sampler = RandomSampler(train_data), pin_memory=True)
 
     train_loss = 0
     recon_loss = 0
     
-    #generate(model, upstream_model, tokenizer, config)
     for batch_id, raw_batch in enumerate(tqdm(data_loader), 1):
         opt.zero_grad()
         opt1.zero_grad()
-        article_batch = tokenizer_decoder(raw_batch, return_tensors='pt', padding=True)['input_ids']
+        article_batch = tokenizer_decoder(raw_batch, return_tensors='pt', padding=True, truncation=True, max_length=32)['input_ids']
         article_batch = article_batch.cuda()
         '''
         article_batch[:article_batch.size(0)//2, ::2] = 33
@@ -244,23 +246,23 @@ def train(data, tokenizer_posterior, tokenizer_decoder, config):
         article_batch[article_batch.size(0)//2:, ::2] = 39
         article_batch[article_batch.size(0)//2:, 1::2] = 33
         '''
-        #article_batch[:, -1] = tokenizer.eos_token_id
         # manually specify h0
         prev_state = [upstream_model.h0.repeat(article_batch.size(0), 1, 1)]
         hidden = (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )),
                   prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )))
-        hidden_posterior = \
-                 (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )),
-                  prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )))
+        #hidden = prev_state[0].new_ones(article_batch.size(0), 0, config.d_latent)
+        #hidden_posterior = \
+        #         (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )),
+        #          prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )))
         sampled_z = None
-        #hidden = prev_state[0].new_ones((article_batch.size(0), 0, config.d_latent))
         batch_rec_loss = 0.
         batch_prior_loss = 0.
-        if batch_id <= config.warmup:
+        if global_step <= config.warmup:
             for param_group in opt.param_groups:
-                param_group['lr'] = param_group['max_lr'] * batch_id / config.warmup
+                param_group['lr'] = param_group['max_lr'] * global_step / config.warmup
+        if global_recon_step <= config.warmup:
             for param_group in opt1.param_groups:
-                param_group['lr'] = param_group['max_lr'] * batch_id / config.warmup
+                param_group['lr'] = param_group['max_lr'] * global_recon_step / config.warmup
         for i, text in enumerate(long_sequence_splitter(article_batch, config.window_len)):
             # add eos token so the low-level model knows when to stop
             #bos_text_eos = torch.cat([text.new_ones(text.size(0), 1)*tokenizer.bos_token_id, text, text.new_ones(text.size(0), 1)*tokenizer.eos_token_id], dim=-1).cuda()
@@ -268,33 +270,54 @@ def train(data, tokenizer_posterior, tokenizer_decoder, config):
             inputs = bos_text_decoder[:, :-1]
             targets = bos_text_decoder[:, 1:]
             inputs_mask = (inputs != tokenizer_decoder.pad_token_id) & (targets != tokenizer_decoder.pad_token_id)
+            # add bos token so our BERT can use it to summarize the block
             bos_text_eos_posterior = torch.cat([text.new_ones(text.size(0), 1)*tokenizer_posterior.bos_token_id,
                                                 text,
                                                 text.new_ones(text.size(0), 1)*tokenizer_posterior.eos_token_id], dim=-1)
-            # add bos token so our BERT can use it to summarize the block
-            #bos_text = torch.cat([text.new_ones(text.size(0), config.state_len)*tokenizer.bos_token_id, text], dim=-1)
             # run q(z|x)
             pooled_posterior = posterior_model(bos_text_eos_posterior)['pooler_output']
-            state_posterior, hidden_posterior = posterior_lstm(pooled_posterior.unsqueeze(1), hidden_posterior)
 
-            qz_mean = state_posterior[:, :, :config.d_latent]
-            qz_logvar = state_posterior[:, :, config.d_latent:]
+            # LSTM posterior
+            #state_posterior, hidden_posterior = posterior_lstm(pooled_posterior.unsqueeze(1), hidden_posterior)
+            #qz_mean = state_posterior[:, :, :config.d_latent]
+            #qz_logvar = state_posterior[:, :, config.d_latent:]
             # use z ~ q(z|x) to generate p(x|z)
-            eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
-            torch.nn.init.trunc_normal_(eps)
-            sampled_z = qz_mean + (0.5*qz_logvar).exp()*eps
+            #eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
+            #torch.nn.init.trunc_normal_(eps)
+
+            if sampled_z is None:
+                pooled_posterior = model.hidden_to_z(pooled_posterior)
+                qz_mean = pooled_posterior.unsqueeze(1)[:, :, :config.d_latent]
+                qz_logvar = pooled_posterior.unsqueeze(1)[:, :, config.d_latent:]
+                eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
+                torch.nn.init.trunc_normal_(eps)
+                qz_mean_true = qz_mean
+                sampled_z = qz_mean_true + (0.5 * qz_logvar).exp() * eps
+            else:
+                pooled_posterior = model.hidden_to_z(pooled_posterior)
+                qz_mean = pooled_posterior.unsqueeze(1)[:, :, :config.d_latent]
+                qz_logvar = pooled_posterior.unsqueeze(1)[:, :, config.d_latent:]
+                eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
+                torch.nn.init.trunc_normal_(eps)
+                qz_mean_true = sampled_z * 0.5 + qz_mean
+                sampled_z = qz_mean_true + (0.5 * qz_logvar).exp() * eps
             preds = model(inputs_embeds=torch.cat([model.z_to_hidden(sampled_z),
-                                model.get_input_embeddings()(inputs)], dim=1))['logits'][:,1:,:]
-            state, hidden = upstream_model(sampled_z, hidden)
+                                model.get_input_embeddings()(inputs)], dim=1))['logits'][:,sampled_z.size(1):,:]
+            
+            state, hidden = upstream_model(sampled_z.detach(), hidden)
+
             # reconstruction loss
             rec_loss = cross_entropy(preds[inputs_mask], targets[inputs_mask])
             # prior matching loss KL(qz||pz)
             if config.state_len > 0:
                 pz_mean = prev_state[-1][:, :, :config.d_latent]
                 pz_logvar = prev_state[-1][:, :, config.d_latent:]
-                prior_loss = 0.5 * ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean - pz_mean)**2)/pz_logvar.exp() - 1).sum(-1).mean()
+                prior_loss = 0.5 * ((pz_logvar-qz_logvar.detach()) + (qz_logvar.detach().exp()+(qz_mean_true.detach() - pz_mean)**2)/pz_logvar.exp() - 1).sum(-1).mean()
+                # variants
+                #prior_loss = ((pz_logvar-qz_logvar.detach())**2+(qz_mean_true.detach() - pz_mean)**2).sum(-1).mean()
+                #prior_loss = 0.5 * ((pz_logvar-qz_logvar) + (qz_logvar.exp()+(qz_mean_true - pz_mean)**2)/pz_logvar.exp() - 1).sum(-1).mean()
                 #prior_reg = 0.001*(0.5 * ((-qz_logvar) + (qz_logvar.exp()+(qz_mean)**2) - 1).sum(-1).mean())
-                prior_reg = 0.001*(0.5 * ((-qz_logvar) + (qz_logvar.exp()+(qz_mean)**2) - 1).sum(-1).mean())
+                #prior_reg = 0.005*(0.5 * ((-qz_logvar) + (qz_logvar.exp()+(qz_mean)**2) - 1).sum(-1).mean())
                 #prior_loss = ((qz_mean.detach() - pz_mean)**2).sum(-1).mean()
                 #prior_loss = ((pz_logvar-qz_logvar.detach())**2 + (qz_mean.detach() - pz_mean)**2).sum(-1).mean()
             else:
@@ -305,24 +328,21 @@ def train(data, tokenizer_posterior, tokenizer_decoder, config):
             #else:
             batch_rec_loss += rec_loss
             batch_prior_loss += prior_loss #+prior_reg
-            #loss.backward(retain_graph=True)
             
-            train_loss += (rec_loss+prior_loss).item()
-            recon_loss += rec_loss.item()
-        #with amp.scale_loss(batch_loss, [opt, opt1]) as scaled_loss:
-        #    scaled_loss.backward()
-        #if type(batch_prior_loss) is torch.Tensor:
-        #    (annealing_sched[global_step]*batch_prior_loss).backward(retain_graph=True)
-        #torch.nn.utils.clip_grad_norm_(chain(amp.master_params(opt),
-        #                                    amp.master_params(opt1)), config.gclip)
-        #(0.2*annealing_sched[global_step]*batch_prior_loss + batch_rec_loss).backward()
+        train_loss += (batch_rec_loss+batch_prior_loss).item() / i
+        recon_loss += batch_rec_loss.item() / i
+        
+        #(0.1*annealing_sched[global_step]*batch_prior_loss + batch_rec_loss).backward()
         (batch_prior_loss + batch_rec_loss).backward()
-        torch.nn.utils.clip_grad_norm_(chain(amp.master_params(opt),
-                                            amp.master_params(opt1)), config.gclip)
-        opt.step()
-        opt1.step()
+        if global_recon_step < config.max_recon_updates:
+            torch.nn.utils.clip_grad_norm_(chain(model.parameters(), posterior_model.parameters()), config.gclip)
+            opt.step()
+            global_recon_step += 1
+        else:
+            torch.nn.utils.clip_grad_norm_(upstream_model.parameters(), config.gclip)
+            opt1.step()
         global_step += 1
-        log_freq = 50
+        log_freq = 100
         if batch_id % log_freq == 0:
             ppl = valid(model, posterior_model, upstream_model, posterior_lstm,
                         data, tokenizer_posterior, tokenizer_decoder, config)
@@ -340,6 +360,7 @@ def train(data, tokenizer_posterior, tokenizer_decoder, config):
 @torch.no_grad()
 def valid(model, posterior_model, upstream_model, posterior_lstm, 
           data, tokenizer_posterior, tokenizer_decoder, config, num_samples=10):
+    # VALIDATION LOGIC IS NOT UPDATE TO DATE.
     model.eval()
     posterior_model.eval()
     upstream_model.eval()
@@ -358,11 +379,11 @@ def valid(model, posterior_model, upstream_model, posterior_lstm,
         article_batch[article_batch.size(0)//2:, ::2] = 39
         article_batch[article_batch.size(0)//2:, 1::2] = 33
         '''
-        #article_batch[:, -1] = tokenizer.eos_token_id
         # manually specify h0
         prev_state = upstream_model.h0.repeat(article_batch.size(0), 1, 1)
         hidden = (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )),
                   prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )))
+        #hidden = prev_state[0].new_ones(article_batch.size(0), 0, config.d_latent)
         hidden_posterior = \
                  (prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )),
                   prev_state[0].new_ones((config.lstm_layers, article_batch.size(0), config.d_model, )))
@@ -390,7 +411,7 @@ def valid(model, posterior_model, upstream_model, posterior_lstm,
             else:
                 eps = qz_mean.new(qz_mean.shape).normal_(0, 1)
                 torch.nn.init.trunc_normal_(eps)
-                sampled_z = qz_mean + (0.5*qz_logvar).exp()*eps
+                sampled_z = qz_mean #+ (0.5*qz_logvar).exp()*eps
                 preds = model(inputs_embeds=torch.cat([model.z_to_hidden(sampled_z),
                               model.get_input_embeddings()(inputs)], dim=1))['logits'][:,1:,:]
             state, hidden = upstream_model(sampled_z, hidden)
@@ -407,12 +428,14 @@ def valid(model, posterior_model, upstream_model, posterior_lstm,
                 prior_loss = 0.
             prev_state = state
             recon_loss += rec_loss.item()
-            valid_loss += (rec_loss + prior_loss).item()
+            valid_loss += 0 #(rec_loss + prior_loss).item()
             total_tokens += inputs_mask.sum().item() #- inputs_mask.size(0)
         if batch_id == num_samples:
             break
     print(f'Recon PPL: {2.71828**(recon_loss/total_tokens)}, Valid PPL: {2.71828**(valid_loss/total_tokens)}')
-    generate(model, upstream_model, tokenizer_decoder, config)
+    generate(model, upstream_model, tokenizer_decoder, config, mode='argmax')
+    print('---------')
+    generate(model, upstream_model, tokenizer_decoder, config, mode='sample')
     #model.train()
     #posterior_model.train()
     upstream_model.train()
@@ -421,13 +444,14 @@ def valid(model, posterior_model, upstream_model, posterior_lstm,
 
 
 @torch.no_grad()
-def generate(model, upstream_model, tokenizer, config):
+def generate(model, upstream_model, tokenizer, config, mode='argmax'):
     model.eval()
     upstream_model.eval()
 
     prev_state = upstream_model.h0.repeat(1, 1, 1)
     hidden = (prev_state[0].new_ones((config.lstm_layers, 1, config.d_model, )),
               prev_state[0].new_ones((config.lstm_layers, 1, config.d_model, )))
+    #hidden = prev_state[0].new_ones(prev_state[0].size(0), 0, config.d_latent)
     #hidden = prev_state[0].new_ones((1, 0, config.d_latent))
     decoded = []
     for i in range(10):
@@ -441,10 +465,12 @@ def generate(model, upstream_model, tokenizer, config):
         for _ in range(config.window_len):
             preds = model(inputs_embeds=torch.cat([model.z_to_hidden(sampled_z),
                           model.get_input_embeddings()(bos_text)], dim=1))['logits'][:,1:,:]
-            #bos_text = torch.cat([bos_text,
-            #                      preds[:, -1, :].softmax(dim=-1).multinomial(num_samples=1)], dim=-1).cuda()    
-            bos_text = torch.cat([bos_text,
-                                  preds[:, -1:, :].argmax(dim=-1)], dim=-1).cuda()    
+            if mode == 'sample':
+                bos_text = torch.cat([bos_text,
+                                    preds[:, -1, :].softmax(dim=-1).multinomial(num_samples=1)], dim=-1).cuda()
+            elif mode == 'argmax':   
+                bos_text = torch.cat([bos_text,
+                                    preds[:, -1:, :].argmax(dim=-1)], dim=-1).cuda()    
         prev_state, hidden = upstream_model(sampled_z, hidden)
         decoded.append(tokenizer.decode(bos_text[0, 1:]))
 
@@ -457,18 +483,15 @@ def generate(model, upstream_model, tokenizer, config):
 if __name__ == '__main__':
     device = 'cuda:0'
     data = load_dataset("wikipedia", "20220301.en")
-    #data = load_from_disk("/home/v-edwardhu/.cache/huggingface/datasets/wikipedia/20220301.en.min10000/train")
     data.filter(lambda x : len(x['text'])>10000)
 
     #tokenizer = setup_tokenizer()
     config = OmegaConf.load('configs/base.yaml')
 
-    from transformers import RobertaTokenizer, RobertaModel, GPT2Tokenizer, OPTForCausalLM
+    from transformers import RobertaTokenizer, RobertaModel, GPT2Tokenizer
 
     tokenizer_posterior = RobertaTokenizer.from_pretrained('roberta-base')
-    tokenizer_decoder = GPT2Tokenizer.from_pretrained('facebook/opt-125m', add_bos_token=False)
-
-    
+    tokenizer_decoder = GPT2Tokenizer.from_pretrained('facebook/opt-125m', add_bos_token=False)    
 
     #last_hidden_states = outputs.last_hidden_state
     
